@@ -1,5 +1,7 @@
 This is a Python program that stabilizes video footage by tracking a subject and cropping the frame to keep it centered. This program utilizes the powerful YOLOv8 library for object detection and tracking, OpenCV for video manipulation, and FFmpeg for robust video encoding. It's designed to be run from the command line with various options for customization.
 
+![demo](https://raw.githubusercontent.com/hunterchen7/stabl/main/examples/f18_1_visualization.gif)
+
 See other [examples](https://github.com/hunterchen7/stabl/tree/main/examples).
 
 ### Features
