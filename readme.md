@@ -24,6 +24,31 @@ pip install opencv-python ultralytics numpy
 
 ### How to Run the Program
 
+### Command-Line Arguments
+
+The script accepts the following arguments:
+
+| Argument            | Type    | Default      | Description |
+|---------------------|---------|--------------|-------------|
+| `input_video`       | str     | (required)   | Path to the input video file. |
+| `output_video`      | str     | (required)   | Path to save the stabilized output video file. |
+| `--target_subject`  | str     | 'person'     | The class of the subject to track (e.g., 'person', 'car', 'dog'). |
+| `--model`           | str     | 'yolov8l.pt' | YOLOv8 model to use (e.g., yolov8n.pt, yolov8l.pt). |
+| `--width`           | int     | 1536         | Width of the output video. |
+| `--height`          | int     | 1536         | Height of the output video. |
+| `--max_pixel_shift` | int     | 50           | Maximum pixel shift for motion control. |
+| `--smoothing_window`| int     | 10           | Number of frames to average for smoothing. |
+| `--video_codec`     | str     | 'libx265'    | FFmpeg video codec (e.g., 'hevc_nvenc' for GPU H.265/HEVC, 'libx264' for CPU H.264). |
+| `--crf`             | int     | 16           | Constant Rate Factor for quality (lower is better). |
+| `--conf`            | float   | 0.4          | Detection confidence threshold for the tracker. |
+
+You can override any of the optional arguments to customize the stabilization process. For example:
+
+```bash
+python stabl.py input.mp4 output.mp4 --target_subject car --width 1920 --height 1080 --video_codec hevc_nvenc --crf 10 --conf 0.5
+```
+
+
 1.  Save the code above as a Python file named `stabilize.py`.
 2.  Open your console or terminal.
 3.  Navigate to the directory where you saved `stabilize.py`.

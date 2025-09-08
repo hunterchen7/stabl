@@ -214,7 +214,6 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description="Stabilize video by tracking a subject, preserving audio and quality.")
-    # (Arguments are the same, but grace_period is removed)
     parser.add_argument('input_video', type=str,
                         help="Path to the input video file.")
     parser.add_argument('output_video', type=str,
