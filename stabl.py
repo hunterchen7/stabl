@@ -231,10 +231,10 @@ if __name__ == '__main__':
                         help="Maximum pixel shift for motion control.")
     parser.add_argument('--smoothing_window', type=int, default=10,
                         help="Number of frames to average for smoothing.")
-    parser.add_argument('--video_codec', type=str, default='libx264',
-                        help="FFmpeg video codec (e.g., 'libx264', 'h264_nvenc' for GPU).")
+    parser.add_argument('--video_codec', type=str, default='libx265',
+                        help="FFmpeg video codec (e.g., 'hevc_nvenc' for GPU H.265/HEVC, 'libx264' for CPU H.264).")
     parser.add_argument('--crf', type=int, default=16,
-                        help="Constant Rate Factor for quality (lower is better, 18 is ~visually lossless).")
+                        help="Constant Rate Factor for quality (lower is better, 10 is high quality for H.265/HEVC).")
     parser.add_argument('--conf', type=float, default=0.4,
                         help="Detection confidence threshold for the tracker.")
 

@@ -37,8 +37,9 @@ python stabl.py "path/to/your/input_video.mp4" "path/to/your/stabilized_video.mp
 
 **Example with Optional Arguments:**
 
-This example will create a 1536x1536 stabilized video with a maximum frame-to-frame shift of 400 pixels, tracking an airplane as the target subject, and using a smoothing window of 3 frames.
+This example will create a 1536x1536 stabilized video with a maximum frame-to-frame shift of 500 pixels, tracking an airplane as the target subject, and using a smoothing window of 3 frames.
 
 ```bash
-python stabl.py "examples/C0018.MP4" "examples/C0018_stabilized.mp4" --width 1536 --height 1536 --target_subject airplane --smoothing_window 3 --max_pixel_shift 400
+python stabl.py "examples/f18_1.MP4" "examples/f18_1_stabilized.mp4" --width 1536 --height 1536 --target_subject airplane --smoothing_window 3 --max_pixel_shift 500
+
 ```
