@@ -45,6 +45,7 @@ The script accepts the following arguments:
 | `--video_codec`     | str     | 'libx265'    | FFmpeg video codec (e.g., 'hevc_nvenc' for GPU H.265/HEVC, 'libx264' for CPU H.264). |
 | `--crf`             | int     | 16           | Constant Rate Factor for quality (lower is better). |
 | `--conf`            | float   | 0.4          | Detection confidence threshold for the tracker. |
+| `--allow_offscreen` | bool    | False        | Allow the crop box to go offscreen, creating black bars. |
 
 You can override any of the optional arguments to customize the stabilization process. For example:
 

@@ -83,7 +83,6 @@ def main(args):
     # --- FFmpeg Subprocess Setup ---
     ffmpeg_command = [
         'ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
-        '-pix_fmt', 'bgr24', '-s', f'{args.width}x{args.height}',
         '-r', str(fps), '-i', '-', '-i', args.input_video,
         '-c:v', args.video_codec, '-preset', 'slow', '-crf', str(args.crf),
         '-c:a', 'copy', '-map', '0:v:0', '-map', '1:a:0?',
@@ -169,12 +168,46 @@ def main(args):
                         smooth_center = prev_smooth_center + direction * args.max_pixel_shift
                 target_center = smooth_center.astype(int)
 
-            crop_x1 = target_center[0] - args.width // 2
-            crop_y1 = target_center[1] - args.height // 2
-            crop_x1 = max(0, min(crop_x1, frame_width - args.width))
-            crop_y1 = max(0, min(crop_y1, frame_height - args.height))
-            last_crop_coords = {"x1": int(crop_x1), "y1": int(crop_y1), "x2": int(
-                crop_x1 + args.width), "y2": int(crop_y1 + args.height)}
+            # --- Cropping and Padding Logic ---
+            # Calculate the ideal crop coordinates
+            ideal_crop_x1 = target_center[0] - args.width // 2
+            ideal_crop_y1 = target_center[1] - args.height // 2
+            ideal_crop_x2 = ideal_crop_x1 + args.width
+            ideal_crop_y2 = ideal_crop_y1 + args.height
+
+            if args.allow_offscreen:
+                # Create a black canvas of the output size
+                output_frame = np.zeros((args.height, args.width, 3), dtype=np.uint8)
+
+                # Find the intersection of the ideal crop and the frame
+                src_x1 = max(0, ideal_crop_x1)
+                src_y1 = max(0, ideal_crop_y1)
+                src_x2 = min(frame_width, ideal_crop_x2)
+                src_y2 = min(frame_height, ideal_crop_y2)
+
+                # Calculate where to place the cropped section on the black canvas
+                dest_x1 = max(0, -ideal_crop_x1)
+                dest_y1 = max(0, -ideal_crop_y1)
+                dest_x2 = dest_x1 + (src_x2 - src_x1)
+                dest_y2 = dest_y1 + (src_y2 - src_y1)
+
+                # If there is a valid intersection, copy the frame data
+                if src_x1 < src_x2 and src_y1 < src_y2:
+                    output_frame[dest_y1:dest_y2, dest_x1:dest_x2] = frame[src_y1:src_y2, src_x1:src_x2]
+
+                cropped_frame = output_frame
+                # Update last_crop_coords for logging purposes
+                last_crop_coords = {"x1": int(ideal_crop_x1), "y1": int(ideal_crop_y1), "x2": int(ideal_crop_x2), "y2": int(ideal_crop_y2)}
+
+            else:
+                # Original logic: Clamp the crop box to the frame boundaries
+                crop_x1 = max(0, min(ideal_crop_x1, frame_width - args.width))
+                crop_y1 = max(0, min(ideal_crop_y1, frame_height - args.height))
+                crop_x2 = crop_x1 + args.width
+                crop_y2 = crop_y1 + args.height
+
+                last_crop_coords = {"x1": int(crop_x1), "y1": int(crop_y1), "x2": int(crop_x2), "y2": int(crop_y2)}
+                cropped_frame = frame[crop_y1:crop_y2, crop_x1:crop_x2]
 
             current_crop_center = (
                 last_crop_coords["x1"] + args.width // 2, last_crop_coords["y1"] + args.height // 2)
@@ -185,8 +218,6 @@ def main(args):
                 f"Processing frame {frame_count}/{total_frames} | Shift (X, Y): ({delta_x}, {delta_y})", flush=True)
             last_crop_center = current_crop_center
 
-            cropped_frame = frame[last_crop_coords["y1"]:last_crop_coords["y2"],
-                                  last_crop_coords["x1"]:last_crop_coords["x2"]]
             if cropped_frame.shape[1] != args.width or cropped_frame.shape[0] != args.height:
                 cropped_frame = cv2.resize(
                     cropped_frame, (args.width, args.height))
@@ -236,6 +267,8 @@ if __name__ == '__main__':
                         help="Constant Rate Factor for quality (lower is better, 10 is high quality for H.265/HEVC).")
     parser.add_argument('--conf', type=float, default=0.4,
                         help="Detection confidence threshold for the tracker.")
+    parser.add_argument('--allow_offscreen', action='store_true',
+                        help="Allow the crop box to go offscreen, creating black bars.")
 
     args = parser.parse_args()
     main(args)
