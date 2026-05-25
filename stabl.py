@@ -21,6 +21,49 @@ def parse_hsv_range(spec):
         )
 
 
+def compute_auto_crop_dims(args, frame_width, frame_height):
+    """Probe the input video to find the largest 16:9 crop that can be centered
+    on the detected (offset-applied) centroid in every frame without ever
+    sliding off the source edges. Returns (width, height) or (None, None) on
+    failure. Color-tracking mode only — YOLO probe would be too slow."""
+    if not args.track_color:
+        print("Auto-crop currently only supported for --track_color mode.")
+        return None, None
+    print(f"Auto-crop probe: scanning all frames of '{args.input_video}'...")
+    cap = cv2.VideoCapture(args.input_video)
+    xs, ys = [], []
+    missed = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        center, _, found = find_color_centroid(
+            frame, args.color_range, args.color_min_area, args.color_max_area)
+        if found:
+            xs.append(center[0] + args.color_offset_x)
+            ys.append(center[1] + args.color_offset_y)
+        else:
+            missed += 1
+    cap.release()
+    if not xs:
+        print("Auto-crop: no centroids detected. Falling back to --width/--height.")
+        return None, None
+    xs = np.array(xs); ys = np.array(ys)
+    Wc = 2 * min(xs.min(), frame_width - xs.max())
+    Hc = 2 * min(ys.min(), frame_height - ys.max())
+    aspect = 16 / 9
+    if Wc / aspect <= Hc:
+        Wc16, Hc16 = Wc, Wc / aspect
+    else:
+        Wc16, Hc16 = Hc * aspect, Hc
+    Wc16 = max(2, int(Wc16) - (int(Wc16) % 2))
+    Hc16 = max(2, int(Hc16) - (int(Hc16) % 2))
+    print(f"Auto-crop: detected {len(xs)}/{len(xs)+missed} frames, "
+          f"centroid X[{int(xs.min())},{int(xs.max())}] Y[{int(ys.min())},{int(ys.max())}] "
+          f"-> optimal 16:9 crop = {Wc16}x{Hc16}")
+    return Wc16, Hc16
+
+
 def find_color_centroid(frame, hsv_ranges, min_area, max_area, prev_center=None):
     """
     Find the centroid of the largest connected blob whose pixels fall within
@@ -165,6 +208,18 @@ def main(args):
     frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+
+    # Optional first-pass probe to auto-compute the largest 16:9 crop that
+    # can follow the detected centroid without ever clamping.
+    if args.auto_crop:
+        w, h = compute_auto_crop_dims(args, frame_width, frame_height)
+        if w is not None:
+            args.width = w
+            args.height = h
+
+    # Re-open for the main pass
+    cap = cv2.VideoCapture(args.input_video)
 
     # --- FFmpeg Subprocess Setup ---
     # --bitrate overrides CRF when set. videotoolbox doesn't accept -crf / -preset;
@@ -295,7 +350,8 @@ def main(args):
                             subject_found_in_frame = True
                             x1, y1, x2, y2 = boxes[subject_index]
                             last_known_center = (
-                                int((x1 + x2) / 2), int((y1 + y2) / 2))
+                                int((x1 + x2) / 2) + args.color_offset_x,
+                                int((y1 + y2) / 2) + args.color_offset_y)
 
                     # If we lost the subject, or never had one, find the best new one immediately.
                     if not subject_found_in_frame:
@@ -305,7 +361,8 @@ def main(args):
 
                         if best_id is not None:
                             tracked_subject_id = best_id
-                            last_known_center = best_center
+                            last_known_center = (best_center[0] + args.color_offset_x,
+                                                 best_center[1] + args.color_offset_y)
                             subject_found_in_frame = True
                             if old_id is None:
                                 print(
@@ -464,9 +521,11 @@ if __name__ == '__main__':
     parser.add_argument('--color_max_area', type=int, default=80000,
                         help="Ignore color blobs larger than this many pixels (default: 80000).")
     parser.add_argument('--color_offset_x', type=int, default=0,
-                        help="Pixel offset added to the detected color centroid's X (positive = right). Use when the color marker isn't where you want the crop center.")
+                        help="Pixel offset added to the detected centroid's X (positive = right). Applies to BOTH color and YOLO tracking modes. Use when the detected point isn't where you want the crop center.")
     parser.add_argument('--color_offset_y', type=int, default=0,
-                        help="Pixel offset added to the detected color centroid's Y (positive = down). E.g. for a red-winged blackbird's shoulder patch, +200 frames the body instead of the shoulder.")
+                        help="Pixel offset added to the detected centroid's Y (positive = down). Applies to BOTH color and YOLO tracking modes. E.g. for a red-winged blackbird's shoulder patch use +200 to frame the body; for a vertical bird (woodpecker) use a negative value to bias toward the head.")
+    parser.add_argument('--auto_crop', action='store_true',
+                        help="First-pass probe the video to find the centroid range, then auto-compute the largest 16:9 crop that can follow the centroid (with offset applied) without ever clamping to the source edges. Overrides --width and --height. Color-tracking mode only.")
 
     args = parser.parse_args()
     if args.device is None:
