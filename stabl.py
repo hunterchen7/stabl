@@ -6,6 +6,32 @@ import threading
 from collections import deque
 
 
+def load_track_csv(path):
+    """Read a per-frame track CSV with header 'frame,x,y,confidence' and return
+    a dict {frame_index: (x, y)} for rows where x >= 0. Frame indices are
+    expected to align with the video's frame ordering (0-based)."""
+    track = {}
+    with open(path) as f:
+        header = f.readline()
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(',')
+            if len(parts) < 3:
+                continue
+            try:
+                frame_idx = int(parts[0])
+                x = float(parts[1])
+                y = float(parts[2])
+            except ValueError:
+                continue
+            if x >= 0 and y >= 0:
+                track[frame_idx] = (int(round(x)), int(round(y)))
+    print(f"Loaded {len(track)} tracked frames from {path}")
+    return track
+
+
 def parse_hsv_range(spec):
     """Parse a string like '0,140,90:12,255,255' into ((H,S,V),(H,S,V))."""
     try:
@@ -21,30 +47,36 @@ def parse_hsv_range(spec):
         )
 
 
-def compute_auto_crop_dims(args, frame_width, frame_height):
+def compute_auto_crop_dims(args, frame_width, frame_height, track_csv_points=None):
     """Probe the input video to find the largest 16:9 crop that can be centered
     on the detected (offset-applied) centroid in every frame without ever
     sliding off the source edges. Returns (width, height) or (None, None) on
-    failure. Color-tracking mode only — YOLO probe would be too slow."""
-    if not args.track_color:
-        print("Auto-crop currently only supported for --track_color mode.")
+    failure. Supported in --track_color and --track_csv modes."""
+    if not args.track_color and track_csv_points is None:
+        print("Auto-crop currently only supported for --track_color / --track_csv modes.")
         return None, None
-    print(f"Auto-crop probe: scanning all frames of '{args.input_video}'...")
-    cap = cv2.VideoCapture(args.input_video)
     xs, ys = [], []
     missed = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        center, _, found = find_color_centroid(
-            frame, args.color_range, args.color_min_area, args.color_max_area)
-        if found:
-            xs.append(center[0] + args.color_offset_x)
-            ys.append(center[1] + args.color_offset_y)
-        else:
-            missed += 1
-    cap.release()
+    if track_csv_points is not None:
+        print(f"Auto-crop probe (csv): {len(track_csv_points)} points")
+        for (x, y) in track_csv_points.values():
+            xs.append(x + args.color_offset_x)
+            ys.append(y + args.color_offset_y)
+    else:
+        print(f"Auto-crop probe: scanning all frames of '{args.input_video}'...")
+        cap = cv2.VideoCapture(args.input_video)
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            center, _, found = find_color_centroid(
+                frame, args.color_range, args.color_min_area, args.color_max_area)
+            if found:
+                xs.append(center[0] + args.color_offset_x)
+                ys.append(center[1] + args.color_offset_y)
+            else:
+                missed += 1
+        cap.release()
     if not xs:
         print("Auto-crop: no centroids detected. Falling back to --width/--height.")
         return None, None
@@ -169,7 +201,14 @@ def main(args):
     # ... (YOLO model loading and subject validation is the same)
     model = None
     target_class_id = None
-    if args.track_color:
+    track_csv_points = None
+    if args.track_csv:
+        track_csv_points = load_track_csv(args.track_csv)
+        if not track_csv_points:
+            print(f"Error: no valid points loaded from --track_csv {args.track_csv}")
+            return
+        print(f"CSV-tracking mode: {len(track_csv_points)} pre-computed points")
+    elif args.track_color:
         if not args.color_range:
             print("Error: --track_color requires at least one --color_range "
                   "(format: H,S,V:H,S,V).")
@@ -213,7 +252,9 @@ def main(args):
     # Optional first-pass probe to auto-compute the largest 16:9 crop that
     # can follow the detected centroid without ever clamping.
     if args.auto_crop:
-        w, h = compute_auto_crop_dims(args, frame_width, frame_height)
+        w, h = compute_auto_crop_dims(
+            args, frame_width, frame_height,
+            track_csv_points=track_csv_points)
         if w is not None:
             args.width = w
             args.height = h
@@ -315,7 +356,14 @@ def main(args):
 
             subject_found_in_frame = False
             last_known_color_bbox = locals().get('last_known_color_bbox', None)
-            if args.track_color:
+            if args.track_csv:
+                # --- Pre-computed per-frame track (e.g. from DLC keypoints) ---
+                pt = track_csv_points.get(frame_count - 1)
+                if pt is not None:
+                    last_known_center = (pt[0] + args.color_offset_x,
+                                         pt[1] + args.color_offset_y)
+                    subject_found_in_frame = True
+            elif args.track_color:
                 # --- Color-anchor detection ---
                 center, bbox, found = find_color_centroid(
                     frame, args.color_range,
@@ -511,6 +559,10 @@ if __name__ == '__main__':
                         help="Allow the crop box to go offscreen, creating black bars.")
     parser.add_argument('--visualize', action='store_true',
                         help="Output a visualization of the source video with the crop box and detected subject point overlaid, instead of the cropped video. Output is downscaled to 1920x1080 for easy preview.")
+    parser.add_argument('--track_csv', type=str, default=None,
+                        help="Path to a per-frame track CSV (header: frame,x,y,confidence). "
+                        "Skips YOLO/color and uses (x,y) per frame as the centroid. "
+                        "Generate from a DLC SuperAnimal-Bird H5 with dlc_to_track.py.")
     parser.add_argument('--track_color', action='store_true',
                         help="Use HSV color thresholding instead of YOLO. Requires at least one --color_range. Faster + more stable when the subject has a distinctive color marker (e.g. red-wing blackbird epaulet).")
     parser.add_argument('--color_range', type=parse_hsv_range, action='append',
