@@ -81,8 +81,22 @@ def compute_auto_crop_dims(args, frame_width, frame_height, track_csv_points=Non
         print("Auto-crop: no centroids detected. Falling back to --width/--height.")
         return None, None
     xs = np.array(xs); ys = np.array(ys)
-    Wc = 2 * min(xs.min(), frame_width - xs.max())
-    Hc = 2 * min(ys.min(), frame_height - ys.max())
+    # Optional percentile clamp on the centroid range so a handful of outlier
+    # detections (e.g. one frame where DLC misfires onto a leaf) don't collapse
+    # the crop. With --auto_crop_percentile 2 the crop covers p2..p98 of the
+    # centroid range; the remaining ~4% of frames clamp at the source edges
+    # at runtime, which the tracker handles fine.
+    pct = getattr(args, "auto_crop_percentile", 0) or 0
+    if pct > 0:
+        xmin = float(np.percentile(xs, pct))
+        xmax = float(np.percentile(xs, 100 - pct))
+        ymin = float(np.percentile(ys, pct))
+        ymax = float(np.percentile(ys, 100 - pct))
+    else:
+        xmin, xmax = float(xs.min()), float(xs.max())
+        ymin, ymax = float(ys.min()), float(ys.max())
+    Wc = 2 * min(xmin, frame_width - xmax)
+    Hc = 2 * min(ymin, frame_height - ymax)
     aspect = 16 / 9
     if Wc / aspect <= Hc:
         Wc16, Hc16 = Wc, Wc / aspect
@@ -578,6 +592,8 @@ if __name__ == '__main__':
                         help="Pixel offset added to the detected centroid's Y (positive = down). Applies to BOTH color and YOLO tracking modes. E.g. for a red-winged blackbird's shoulder patch use +200 to frame the body; for a vertical bird (woodpecker) use a negative value to bias toward the head.")
     parser.add_argument('--auto_crop', action='store_true',
                         help="First-pass probe the video to find the centroid range, then auto-compute the largest 16:9 crop that can follow the centroid (with offset applied) without ever clamping to the source edges. Overrides --width and --height. Color-tracking mode only.")
+    parser.add_argument('--auto_crop_percentile', type=int, default=0,
+                        help="When set (e.g. 2), --auto_crop uses the p<N>..p<100-N> range of centroid positions instead of strict min/max. Lets a few outlier detections clamp at edges instead of collapsing the whole crop. Recommended 1-3 for DLC tracks where misdetections are rare but possible.")
 
     args = parser.parse_args()
     if args.device is None:

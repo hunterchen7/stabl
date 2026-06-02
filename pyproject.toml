@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stabl"
+version = "0.1.0"
+description = "Subject-tracking video stabilization (KLT, DLC, YOLO)"
+requires-python = ">=3.10"
+dependencies = [
+  "opencv-python>=4.8",
+  "numpy>=1.24",
+  "pandas>=2.0",
+]
+
+[project.optional-dependencies]
+api = [
+  "fastapi>=0.110",
+  "uvicorn[standard]>=0.27",
+  "python-multipart>=0.0.9",
+  "boto3>=1.34",
+]
+dlc = [
+  "deeplabcut>=3.0",
+  "torch",
+  "torchvision",
+  "tables",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["server*"]

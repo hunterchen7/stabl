@@ -1,0 +1,19 @@
+[Unit]
+Description=stabl FastAPI server (uvicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=olares
+WorkingDirectory=/home/olares/stabl
+EnvironmentFile=/home/olares/stabl/deploy/stabl.env
+ExecStart=/home/olares/.venv-dlc/bin/uvicorn server.main:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips=127.0.0.1
+Restart=on-failure
+RestartSec=5
+# Big multipart uploads can take a while; don't let systemd time them out
+TimeoutStopSec=120
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
