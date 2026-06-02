@@ -118,23 +118,6 @@ def sync(body: dict | None = None) -> dict:
     return {"sha": sha, "branch": branch, "log": out, "restarting": True}
 
 
-@app.post("/v1/deploy", dependencies=[Depends(require_bearer)])
-async def deploy(file: UploadFile = File(...), rel_path: str = Form(...)) -> dict:
-    """Overwrite a file under STABL_REPO_ROOT with the uploaded body.
-    Restricted to paths inside the repo; no `..` allowed. Used to push
-    klt_affine.py / runners.py / etc. without needing SSH access."""
-    rel = Path(rel_path)
-    if rel.is_absolute() or any(part == ".." for part in rel.parts):
-        raise HTTPException(400, "rel_path must be relative and not contain ..")
-    dest = (settings.REPO_ROOT / rel).resolve()
-    if not str(dest).startswith(str(settings.REPO_ROOT.resolve())):
-        raise HTTPException(400, "rel_path resolves outside the repo")
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    with dest.open("wb") as f:
-        shutil.copyfileobj(file.file, f)
-    return {"path": str(dest), "size": dest.stat().st_size}
-
-
 @app.post("/v1/restart", dependencies=[Depends(require_bearer)])
 async def restart() -> dict:
     """Schedule a server restart shortly after responding so the systemd

@@ -46,9 +46,6 @@ case "$cmd" in
   jobs)    curl -fsS "${AUTH[@]}" "$BASE/v1/jobs" ;;
   get)     # stabl get <file_id> <out-path>
     curl -fsS "${AUTH[@]}" -o "$2" "$BASE/v1/files/$1" ;;
-  deploy)  # stabl deploy <local_path> <rel_path_in_repo>
-    path="$1"; rel="$2"
-    curl -fsS "${AUTH[@]}" -F "rel_path=$rel" -F "file=@$path" "$BASE/v1/deploy" ;;
   restart) curl -fsS "${AUTH[@]}" -X POST "$BASE/v1/restart" ;;
   version) curl -fsS "$BASE/v1/version" ;;
   sync)    # stabl sync [branch]
