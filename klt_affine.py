@@ -124,6 +124,17 @@ def main() -> None:
                          "warp, ECC-refine each frame against FRAME 0 on this textured patch "
                          "for a sub-pixel lock (KLT-grade precision with tracker robustness). "
                          "The coarse warp puts the residual within ~2px, so ECC can't wander.")
+    ap.add_argument("--anchor_bbox", default=None,
+                    help="(tracks_json) x1,y1,x2,y2 source px — like --refine_bbox but uses "
+                         "normalized cross-correlation (matchTemplate) instead of ECC. NCC picks "
+                         "the GLOBAL correlation peak in a +/-pad search window, so repetitive "
+                         "texture (lichen/bark) can't trap it in a wrong local minimum the way "
+                         "ECC's gradient descent does. This is the same metric used to measure "
+                         "lock, so it drives measured displacement to ~0 directly. Translational.")
+    ap.add_argument("--anchor_pad", type=int, default=120,
+                    help="Search half-range (px) for --anchor_bbox NCC matching.")
+    ap.add_argument("--anchor_min_cc", type=float, default=0.5,
+                    help="Min NCC peak to accept an --anchor_bbox correction.")
     ap.add_argument("--auto_pick", action="store_true",
                     help="Two-pass mode: pick many candidate features, track them through "
                          "the whole clip, keep the most durable subset for the real run. "
@@ -483,6 +494,27 @@ def main() -> None:
             refine = dict(n_ok=0, n_skip=0)
             print(f"refine: patch ({rx1},{ry1})-({rx2},{ry2}) window {rww}x{rwh}", flush=True)
 
+        # NCC template-anchor: re-anchor every frame's knot to its frame-0
+        # position via matchTemplate. The coarse track warp brings the frame into
+        # frame-0 coords; we then NCC the frame-0 knot template inside a padded
+        # search window and translate the warp by the residual. Global-peak search
+        # immune to the repetitive-bark local minima that defeat ECC.
+        anchor = None
+        if args.anchor_bbox:
+            ax1, ay1, ax2, ay2 = (int(v) for v in args.anchor_bbox.split(","))
+            apad = args.anchor_pad
+            awx1 = max(0, ax1 - apad); awy1 = max(0, ay1 - apad)
+            awx2 = min(W, ax2 + apad); awy2 = min(H, ay2 + apad)
+            awW, awH = awx2 - awx1, awy2 - awy1
+            g0a = cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            anchor_tmpl = g0a[ay1:ay2, ax1:ax2].copy()        # frame-0 knot
+            # Expected peak top-left in the window frame if perfectly aligned:
+            exp_x, exp_y = ax1 - awx1, ay1 - awy1
+            T_shift_a = np.array([[1, 0, -awx1], [0, 1, -awy1], [0, 0, 1]], dtype=np.float64)
+            anchor = dict(n_ok=0, n_skip=0)
+            print(f"anchor(NCC): knot ({ax1},{ay1})-({ax2},{ay2}) window {awW}x{awH} "
+                  f"search +/-{apad}px", flush=True)
+
         enc = pick_encoder(preview=args.preview)
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
                "-f", "rawvideo", "-pix_fmt", "bgr24",
@@ -530,6 +562,32 @@ def main() -> None:
                     refine["n_ok"] += 1
                 else:
                     refine["n_skip"] += 1
+            if anchor is not None and fi > 0:
+                win_M = (T_shift_a @ M3)[:2].astype(np.float32)
+                aligned = cv2.warpAffine(frame, win_M, (awW, awH), flags=cv2.INTER_LINEAR)
+                aligned = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY).astype(np.float32)
+                res = cv2.matchTemplate(aligned, anchor_tmpl, cv2.TM_CCOEFF_NORMED)
+                _, mx, _, mloc = cv2.minMaxLoc(res)
+                if mx >= args.anchor_min_cc:
+                    px, py = mloc
+                    # Sub-pixel parabolic peak refinement.
+                    if 0 < px < res.shape[1] - 1:
+                        dl, dc, dr = res[py, px - 1], res[py, px], res[py, px + 1]
+                        den = dl - 2 * dc + dr
+                        if abs(den) > 1e-6:
+                            px = px + 0.5 * (dl - dr) / den
+                    if 0 < py < res.shape[0] - 1:
+                        du, dc, dd = res[py - 1, mloc[0]], res[mloc[1], mloc[0]], res[py + 1, mloc[0]]
+                        den = du - 2 * dc + dd
+                        if abs(den) > 1e-6:
+                            py = py + 0.5 * (du - dd) / den
+                    # Residual: where the knot landed vs where it should be (frame-0).
+                    dx = px - exp_x; dy = py - exp_y
+                    Tcorr = np.array([[1, 0, -dx], [0, 1, -dy], [0, 0, 1]], dtype=np.float64)
+                    M3 = Tcorr @ M3
+                    anchor["n_ok"] += 1
+                else:
+                    anchor["n_skip"] += 1
             out_M = (T_out @ M3)[:2].astype(np.float32)
             stab = cv2.warpAffine(frame, out_M, (crop_w, crop_h),
                                   flags=cv2.INTER_CUBIC, borderMode=border_mode)
@@ -542,6 +600,8 @@ def main() -> None:
         proc.wait()
         if refine:
             print(f"refine: {refine['n_ok']} ok, {refine['n_skip']} skipped", flush=True)
+        if anchor:
+            print(f"anchor: {anchor['n_ok']} ok, {anchor['n_skip']} skipped", flush=True)
         print(f"done -> {args.output}", flush=True)
         return
 
