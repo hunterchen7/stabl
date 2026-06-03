@@ -102,6 +102,10 @@ def main() -> None:
                     help="Use pre-computed tracks (e.g. from cotracker_track.py) "
                          "instead of running KLT. Expects JSON with per-frame [x,y,vis] "
                          "lists per point.")
+    ap.add_argument("--warps_json", default=None,
+                    help="Use pre-computed per-frame warps (from klt_track.py's "
+                         "frame-to-frame accumulator). JSON {warps:[[2x3],...]} mapping "
+                         "frame_i->frame_0. Skips fitting; goes straight to crop/refine.")
     ap.add_argument("--vis_thresh", type=float, default=0.7,
                     help="Visibility threshold for using a point in the RANSAC fit "
                          "when tracks_json is provided.")
@@ -176,23 +180,30 @@ def main() -> None:
 
     gray0 = cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY)
 
-    if args.tracks_json:
-        # Pre-computed tracks (e.g. CoTracker3). Skip KLT, run the warp loop
-        # directly off the JSON.
+    if args.tracks_json or args.warps_json:
+        # Pre-computed motion. Either per-point tracks (CoTracker / local KLT, we
+        # fit the per-frame warp here) or per-frame warps directly (--warps_json
+        # from klt_track.py's frame-to-frame accumulator).
         import json
-        with open(args.tracks_json) as f:
-            td = json.load(f)
-        tracks = np.array(td["tracks"])  # [N, P, 3] = (x, y, visibility)
-        N = tracks.shape[0]
-        P = tracks.shape[1]
-        # Use frame 0 visible points as the "init" set
-        init_full = tracks[0, :, :2].astype(np.float32)
-        print(f"loaded {P} tracks over {N} frames; vis_thresh={args.vis_thresh}", flush=True)
+        if args.warps_json:
+            with open(args.warps_json) as f:
+                wd = json.load(f)
+            Ms = [np.asarray(w, dtype=np.float32) for w in wd["warps"]]
+            N = len(Ms)
+            print(f"loaded {N} precomputed warps from {args.warps_json}", flush=True)
+        else:
+            with open(args.tracks_json) as f:
+                td = json.load(f)
+            tracks = np.array(td["tracks"])  # [N, P, 3] = (x, y, visibility)
+            N = tracks.shape[0]
+            P = tracks.shape[1]
+            init_full = tracks[0, :, :2].astype(np.float32)
+            print(f"loaded {P} tracks over {N} frames; vis_thresh={args.vis_thresh}", flush=True)
 
         # Consensus filter: per-frame RANSAC inlier rate per track. Tracks that
         # disagree with the rigid-body motion (the bird flying away, a leaf
         # moving in wind) get rejected before the warp pass.
-        if args.consensus_filter:
+        if args.tracks_json and args.consensus_filter:
             inlier_count = np.zeros(P, dtype=np.int32)
             visible_count = np.zeros(P, dtype=np.int32)
             for fi in range(1, N):
@@ -304,11 +315,11 @@ def main() -> None:
                 M = similarity_fit(src[keep], dst[keep])
             return M
 
-        Ms = []
+        Ms = Ms if args.warps_json else []
         good_fit = np.zeros(N, dtype=bool)
         ident = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
         last_M = ident.copy()
-        for fi in range(N):
+        for fi in range(N if args.tracks_json else 0):
             if fi == 0:
                 Ms.append(ident.copy()); good_fit[0] = True; continue
             visible = tracks[fi, :, 2] >= args.vis_thresh
@@ -329,7 +340,7 @@ def main() -> None:
         # bracketing good frames (camera motion is continuous; gaps are short).
         # Holding a frozen warp through a gap lets the scene drift — this doesn't.
         n_interp = 0
-        gi = np.where(good_fit)[0]
+        gi = np.where(good_fit)[0] if args.tracks_json else np.array([], dtype=int)
         for a, b in zip(gi[:-1], gi[1:]):
             if b - a <= 1:
                 continue
@@ -345,8 +356,9 @@ def main() -> None:
                 Ms[fi] = np.array([[sc * np.cos(ang), -sc * np.sin(ang), tx],
                                    [sc * np.sin(ang),  sc * np.cos(ang), ty]], dtype=np.float32)
                 n_interp += 1
-        print(f"fit: {int(good_fit.sum())}/{N} frames direct, {n_interp} interpolated, "
-              f"{N - int(good_fit.sum()) - n_interp} held", flush=True)
+        if args.tracks_json:
+            print(f"fit: {int(good_fit.sum())}/{N} frames direct, {n_interp} interpolated, "
+                  f"{N - int(good_fit.sum()) - n_interp} held", flush=True)
 
         # Optional light temporal smoothing of the warp to remove residual
         # per-frame estimation jitter (safe for a static lock — no subject lag).
@@ -441,6 +453,8 @@ def main() -> None:
                "-c:a", "aac", "-b:a", "192k", "-shortest", args.output]
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         assert proc.stdin
+        cap.release()
+        cap = cv2.VideoCapture(args.input)   # rewind: frame0 was consumed at top of main()
         for fi in range(N):
             ok, frame = cap.read()
             if not ok: break
