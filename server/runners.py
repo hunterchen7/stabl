@@ -230,7 +230,32 @@ def run_cotracker_stabl(job: jobs.Job) -> None:
         cmd += ["--query_points", p["query_points"]]
     if p.get("expand_patch") is not None:
         cmd += ["--expand_patch", str(p["expand_patch"])]
-    _run_subprocess(job, cmd)
+    if p.get("track_window"):
+        cmd += ["--track_window", p["track_window"]]
+    if p.get("track_window_pad") is not None:
+        cmd += ["--track_window_pad", str(p["track_window_pad"])]
+
+    # Track cache: tracking only depends on the clip + tracking params, not on
+    # crop/fit/encode. Cache so crop/framing iterations don't re-run the tracker.
+    import hashlib, json as _json, shutil as _shutil
+    cache_key = hashlib.sha256(_json.dumps({
+        "clip": p.get("pictures_path") or p.get("clip_id"),
+        "qp": p.get("query_points"), "ep": p.get("expand_patch"),
+        "tw": p.get("track_window"), "twp": p.get("track_window_pad"),
+        "mtd": p.get("max_track_dim", 640), "mode": p.get("cotracker_mode", "offline"),
+        "mask": p.get("mask_circle"), "n": p.get("n_points", 80),
+        "trim": (p.get("start_sec"), p.get("duration_sec")),
+    }, sort_keys=True).encode()).hexdigest()[:16]
+    cache_dir = settings.DATA_DIR / "track-cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cached = cache_dir / f"{cache_key}.json"
+    if p.get("reuse_tracks", True) and cached.exists():
+        jobs.append_log(job, f"track cache HIT {cache_key} — skipping CoTracker")
+        _shutil.copy(cached, tracks_json)
+    else:
+        _run_subprocess(job, cmd)
+        _shutil.copy(tracks_json, cached)
+        jobs.append_log(job, f"track cache STORE {cache_key}")
 
     file_id, out_path = _output_path()
     script = settings.REPO_ROOT / "klt_affine.py"
@@ -259,6 +284,8 @@ def run_cotracker_stabl(job: jobs.Job) -> None:
         cmd += ["--auto_crop_pct", str(p.get("auto_crop_pct", 2.0))]
         cmd += ["--aspect", p.get("aspect", "16:9")]
         cmd += ["--bias_x", str(p.get("bias_x", 0)), "--bias_y", str(p.get("bias_y", 0))]
+    if p.get("warp_smooth") is not None:
+        cmd += ["--warp_smooth", str(p["warp_smooth"])]
     _run_subprocess(job, cmd)
     job.output_file_id = file_id
 

@@ -105,6 +105,10 @@ def main() -> None:
     ap.add_argument("--vis_thresh", type=float, default=0.7,
                     help="Visibility threshold for using a point in the RANSAC fit "
                          "when tracks_json is provided.")
+    ap.add_argument("--warp_smooth", type=int, default=0,
+                    help="(tracks_json) Moving-average window over the per-frame warp to "
+                         "remove residual estimation jitter. Safe for a static lock (no lag). "
+                         "0/1 = off; try 3-5.")
     ap.add_argument("--auto_pick", action="store_true",
                     help="Two-pass mode: pick many candidate features, track them through "
                          "the whole clip, keep the most durable subset for the real run. "
@@ -264,6 +268,37 @@ def main() -> None:
         # ---- Pass A: compute the stabilizing warp M (current->frame0) for every
         # frame from the tracks alone (no video read). M is applied to a frame to
         # bring its tracked points back to their frame-0 positions. ----
+        def similarity_fit(src, dst):
+            """Closed-form similarity (rotation + uniform scale + translation)
+            mapping src->dst, using ALL points (deterministic — no RANSAC jitter).
+            Umeyama 1991."""
+            src_m = src.mean(0); dst_m = dst.mean(0)
+            sc = src - src_m; dc = dst - dst_m
+            Hcov = (sc.T @ dc) / len(src)
+            U, S, Vt = np.linalg.svd(Hcov)
+            d = 1.0 if np.linalg.det(Vt.T @ U.T) > 0 else -1.0
+            D = np.diag([1.0, d])
+            R = (Vt.T @ D @ U.T)
+            var = (sc ** 2).sum() / len(src)
+            s = (S @ np.array([1.0, d])) / var if var > 1e-9 else 1.0
+            t = dst_m - s * (R @ src_m)
+            M = np.zeros((2, 3), np.float32)
+            M[:2, :2] = (s * R).astype(np.float32)
+            M[:, 2] = t.astype(np.float32)
+            return M
+
+        def robust_fit(src, dst):
+            """similarity_fit + one IRLS reject pass (drop points >3x median
+            residual, refit) — deterministic robustness without RANSAC."""
+            M = similarity_fit(src, dst)
+            proj = (M[:, :2] @ src.T).T + M[:, 2]
+            res = np.linalg.norm(proj - dst, axis=1)
+            med = np.median(res)
+            keep = res <= max(3.0 * med, 1.0)
+            if 3 <= keep.sum() < len(src):
+                M = similarity_fit(src[keep], dst[keep])
+            return M
+
         Ms = []
         ident = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
         last_M = ident.copy()
@@ -279,14 +314,24 @@ def main() -> None:
                 M = np.array([[1, 0, float(np.median(disp[:, 0]))],
                               [0, 1, float(np.median(disp[:, 1]))]], dtype=np.float32)
             else:
-                M, _ = cv2.estimateAffinePartial2D(
-                    cur[visible], init_full[visible],
-                    method=cv2.RANSAC, ransacReprojThreshold=args.ransac_thresh,
-                    maxIters=2000, confidence=0.999)
-                if M is None:
-                    M = last_M
+                M = robust_fit(cur[visible], init_full[visible])
             M = M.astype(np.float32)
             Ms.append(M); last_M = M
+
+        # Optional light temporal smoothing of the warp to remove residual
+        # per-frame estimation jitter (safe for a static lock — no subject lag).
+        if args.warp_smooth > 1:
+            k = args.warp_smooth
+            arr = np.stack(Ms).astype(np.float64)        # [N,2,3]
+            pad = k // 2
+            padded = np.pad(arr, ((pad, pad), (0, 0), (0, 0)), mode="edge")
+            kernel = np.ones(k) / k
+            out = np.empty_like(arr)
+            for i in range(2):
+                for j in range(3):
+                    out[:, i, j] = np.convolve(padded[:, i, j], kernel, mode="valid")[:N]
+            Ms = [out[fi].astype(np.float32) for fi in range(N)]
+            print(f"warp_smooth: moving-average window {k}", flush=True)
 
         # ---- Crop: border-safe region in stabilized (frame-0) space. A dst pixel
         # is valid iff it lies in M @ (frame rect); the inner AABB per frame, taken

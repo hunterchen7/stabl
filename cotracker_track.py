@@ -44,6 +44,14 @@ def main() -> None:
                     help="If >0, each query point gets expanded into a 3x3 grid of points "
                          "with this radius (pixels in source). Lets a single user-picked "
                          "location yield rotation/scale info via relative motion.")
+    ap.add_argument("--track_window", default=None,
+                    help="x1,y1,x2,y2 in SOURCE px — crop to this window and track it at "
+                         "(near) full resolution. Much more precise than downscaling the "
+                         "whole 4K frame. If omitted but query_points given, derived from "
+                         "their bbox + track_window_pad.")
+    ap.add_argument("--track_window_pad", type=int, default=300,
+                    help="Pad (px) for the auto-derived track window; must exceed camera "
+                         "shake so the points never leave the window.")
     args = ap.parse_args()
 
     import torch
@@ -59,16 +67,35 @@ def main() -> None:
     fps = cap.get(cv2.CAP_PROP_FPS)
     N = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-    scale = min(1.0, args.max_track_dim / max(W, H))
-    Wt = int(W * scale)
-    Ht = int(H * scale)
-    print(f"src {W}x{H} @ {fps:.2f}fps, {N} frames -> tracking at {Wt}x{Ht} (scale {scale:.3f})", flush=True)
+    # Optional crop window: track only a small region (around the stick) at full
+    # resolution. Far more precise than downscaling the whole 4K frame, because
+    # the tracked points aren't scaled up (a 0.5px error at 640px becomes ~6px at
+    # 4K). Window is given, or derived from the query points + pad.
+    ox, oy = 0, 0
+    win_w, win_h = W, H
+    if args.track_window:
+        ox, oy, wx2, wy2 = (int(v) for v in args.track_window.split(","))
+        win_w, win_h = wx2 - ox, wy2 - oy
+    elif args.query_points:
+        qp = np.array([[float(x), float(y)] for x, y in
+                       (c.split(",") for c in args.query_points.split(";"))])
+        pad = args.track_window_pad + (args.expand_patch if args.expand_patch > 0 else 0)
+        ox = max(0, int(qp[:, 0].min() - pad)); oy = max(0, int(qp[:, 1].min() - pad))
+        wx2 = min(W, int(qp[:, 0].max() + pad)); wy2 = min(H, int(qp[:, 1].max() + pad))
+        win_w, win_h = wx2 - ox, wy2 - oy
+
+    scale = min(1.0, args.max_track_dim / max(win_w, win_h))
+    Wt, Ht = int(win_w * scale), int(win_h * scale)
+    print(f"src {W}x{H} @ {fps:.2f}fps, {N} frames | window ({ox},{oy}) {win_w}x{win_h} "
+          f"-> tracking at {Wt}x{Ht} (scale {scale:.3f})", flush=True)
 
     frames = []
     while True:
         ok, f = cap.read()
         if not ok: break
-        f = cv2.resize(f, (Wt, Ht))
+        f = f[oy:oy + win_h, ox:ox + win_w]
+        if scale != 1.0:
+            f = cv2.resize(f, (Wt, Ht))
         frames.append(cv2.cvtColor(f, cv2.COLOR_BGR2RGB))
     cap.release()
     video = np.stack(frames)  # [N, Ht, Wt, 3]
@@ -76,7 +103,7 @@ def main() -> None:
     video = torch.from_numpy(video).permute(0, 3, 1, 2).float() / 255.0
     video = video[None].cuda()  # [1, N, 3, Ht, Wt]
 
-    # Pick query points on frame 0 (in tracking coords).
+    # Pick query points on frame 0 (in tracking coords = (src - window_origin) * scale).
     if args.query_points:
         pts_src = np.array([
             [float(x), float(y)]
@@ -91,7 +118,7 @@ def main() -> None:
                         grid.append([cx + dx, cy + dy])
             pts_src = np.array(grid)
             print(f"expanded {len(pts_src)//9} centers into {len(pts_src)} grid points (r={r})", flush=True)
-        pts = pts_src * scale  # to tracking coords
+        pts = (pts_src - np.array([ox, oy])) * scale  # src -> window-local tracking coords
         P = len(pts)
         queries = torch.zeros(1, P, 3, device="cuda")
         queries[0, :, 0] = 0
@@ -103,7 +130,7 @@ def main() -> None:
         mask = None
         if args.mask_circle:
             cx, cy, r = (float(v) for v in args.mask_circle.split(","))
-            cx *= scale; cy *= scale; r *= scale
+            cx = (cx - ox) * scale; cy = (cy - oy) * scale; r *= scale
             mask = np.ones((Ht, Wt), dtype=np.uint8) * 255
             cv2.circle(mask, (int(cx), int(cy)), int(r), 0, -1)
         corners = cv2.goodFeaturesToTrack(
@@ -132,8 +159,8 @@ def main() -> None:
     pred_visibility = pred_visibility.cpu().numpy()[0]  # [N, P]
     print(f"got tracks {pred_tracks.shape}, mean visibility {pred_visibility.mean():.3f}", flush=True)
 
-    # Scale back to source
-    src_tracks = pred_tracks / scale
+    # Window-local tracking coords -> full-frame source coords.
+    src_tracks = pred_tracks / scale + np.array([ox, oy], dtype=np.float32)
     out = {
         "width": W, "height": H, "fps": float(fps),
         "n_frames": int(src_tracks.shape[0]), "n_points": int(P),
