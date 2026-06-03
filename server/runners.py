@@ -205,21 +205,15 @@ def _add_klt_encode_flags(cmd: list, p: dict) -> None:
         cmd += ["--ransac_thresh", str(p["ransac_thresh"])]
 
 
-def run_cotracker_stabl(job: jobs.Job) -> None:
-    """CoTracker3 tracking + affine warp. Tracks N points jointly via the
-    transformer-based tracker (survives occlusion/wing flap), then runs the
-    same affine RANSAC + warp as klt-affine.
-    """
-    p = job.params
-    clip_path = _maybe_trim(job, _resolve_clip(p), p)
-    work = settings.DATA_DIR / "jobs" / job.id
-    work.mkdir(parents=True, exist_ok=True)
-    tracks_json = work / "tracks.json"
-
+def _cotracker_tracks(job: jobs.Job, p: dict, clip_path: Path, out_json: Path) -> None:
+    """Run (or cache-fetch) CoTracker3 tracks for the given params into out_json.
+    Tracking only depends on the clip + tracking params, not crop/fit/encode —
+    cached so framing iterations don't re-run the ~2min tracker."""
+    import hashlib, json as _json, shutil as _shutil
     cmd = [
         sys.executable, str(settings.REPO_ROOT / "cotracker_track.py"),
         "--input", str(clip_path),
-        "--output_json", str(tracks_json),
+        "--output_json", str(out_json),
         "--n_points", str(p.get("n_points", 80)),
         "--max_track_dim", str(p.get("max_track_dim", 640)),
         "--mode", p.get("cotracker_mode", "offline"),
@@ -235,9 +229,6 @@ def run_cotracker_stabl(job: jobs.Job) -> None:
     if p.get("track_window_pad") is not None:
         cmd += ["--track_window_pad", str(p["track_window_pad"])]
 
-    # Track cache: tracking only depends on the clip + tracking params, not on
-    # crop/fit/encode. Cache so crop/framing iterations don't re-run the tracker.
-    import hashlib, json as _json, shutil as _shutil
     cache_key = hashlib.sha256(_json.dumps({
         "clip": p.get("pictures_path") or p.get("clip_id"),
         "qp": p.get("query_points"), "ep": p.get("expand_patch"),
@@ -251,11 +242,24 @@ def run_cotracker_stabl(job: jobs.Job) -> None:
     cached = cache_dir / f"{cache_key}.json"
     if p.get("reuse_tracks", True) and cached.exists():
         jobs.append_log(job, f"track cache HIT {cache_key} — skipping CoTracker")
-        _shutil.copy(cached, tracks_json)
+        _shutil.copy(cached, out_json)
     else:
         _run_subprocess(job, cmd)
-        _shutil.copy(tracks_json, cached)
+        _shutil.copy(out_json, cached)
         jobs.append_log(job, f"track cache STORE {cache_key}")
+
+
+def run_cotracker_stabl(job: jobs.Job) -> None:
+    """CoTracker3 tracking + affine warp. Tracks N points jointly via the
+    transformer-based tracker (survives occlusion/wing flap), then runs the
+    same affine RANSAC + warp as klt-affine.
+    """
+    p = job.params
+    clip_path = _maybe_trim(job, _resolve_clip(p), p)
+    work = settings.DATA_DIR / "jobs" / job.id
+    work.mkdir(parents=True, exist_ok=True)
+    tracks_json = work / "tracks.json"
+    _cotracker_tracks(job, p, clip_path, tracks_json)
 
     file_id, out_path = _output_path()
     script = settings.REPO_ROOT / "klt_affine.py"
@@ -286,6 +290,8 @@ def run_cotracker_stabl(job: jobs.Job) -> None:
         cmd += ["--bias_x", str(p.get("bias_x", 0)), "--bias_y", str(p.get("bias_y", 0))]
     if p.get("warp_smooth") is not None:
         cmd += ["--warp_smooth", str(p["warp_smooth"])]
+    if p.get("refine_bbox"):
+        cmd += ["--refine_bbox", p["refine_bbox"]]
     _run_subprocess(job, cmd)
     job.output_file_id = file_id
 
@@ -296,26 +302,10 @@ def run_cotracker_track(job: jobs.Job) -> None:
     stabilized video. ~3-8 MB JSON vs 100+ MB MP4."""
     p = job.params
     clip_path = _maybe_trim(job, _resolve_clip(p), p)
-    file_id = uuid.uuid4().hex if False else None
-    # Use _output_path's id but with a .json suffix
     import uuid as _uuid
     file_id = _uuid.uuid4().hex
     out_path = settings.OUTPUTS_DIR / f"{file_id}.json"
-    cmd = [
-        sys.executable, str(settings.REPO_ROOT / "cotracker_track.py"),
-        "--input", str(clip_path),
-        "--output_json", str(out_path),
-        "--n_points", str(p.get("n_points", 80)),
-        "--max_track_dim", str(p.get("max_track_dim", 480)),
-        "--mode", p.get("cotracker_mode", "online"),
-    ]
-    if p.get("mask_circle"):
-        cmd += ["--mask_circle", p["mask_circle"]]
-    if p.get("query_points"):
-        cmd += ["--query_points", p["query_points"]]
-    if p.get("expand_patch") is not None:
-        cmd += ["--expand_patch", str(p["expand_patch"])]
-    _run_subprocess(job, cmd)
+    _cotracker_tracks(job, p, clip_path, out_path)
     job.output_file_id = file_id
 
 

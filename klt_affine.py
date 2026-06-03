@@ -109,6 +109,11 @@ def main() -> None:
                     help="(tracks_json) Moving-average window over the per-frame warp to "
                          "remove residual estimation jitter. Safe for a static lock (no lag). "
                          "0/1 = off; try 3-5.")
+    ap.add_argument("--refine_bbox", default=None,
+                    help="(tracks_json) x1,y1,x2,y2 source px — after the coarse track-based "
+                         "warp, ECC-refine each frame against FRAME 0 on this textured patch "
+                         "for a sub-pixel lock (KLT-grade precision with tracker robustness). "
+                         "The coarse warp puts the residual within ~2px, so ECC can't wander.")
     ap.add_argument("--auto_pick", action="store_true",
                     help="Two-pass mode: pick many candidate features, track them through "
                          "the whole clip, keep the most durable subset for the real run. "
@@ -377,6 +382,27 @@ def main() -> None:
         T_out = np.array([[1, 0, -cx0], [0, 1, -cy0], [0, 0, 1]], dtype=np.float32)
 
         # ---- Pass B: render. ----
+        # Optional per-frame sub-pixel ECC refinement against FRAME 0 on a small
+        # textured patch. The coarse track-based warp puts the residual within a
+        # couple of px, so ECC starts inside its convergence basin every frame —
+        # none of the drift/ambiguity failure modes of standalone ECC.
+        refine = None
+        if args.refine_bbox:
+            rx1, ry1, rx2, ry2 = (int(v) for v in args.refine_bbox.split(","))
+            rpad = 120
+            rwx1 = max(0, rx1 - rpad); rwy1 = max(0, ry1 - rpad)
+            rwx2 = min(W, rx2 + rpad); rwy2 = min(H, ry2 + rpad)
+            rww, rwh = rwx2 - rwx1, rwy2 - rwy1
+            gray0_full = cv2.cvtColor(frame0, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+            tmpl_win = gray0_full[rwy1:rwy2, rwx1:rwx2].copy()
+            rmask = np.zeros((rwh, rww), np.uint8)
+            cv2.rectangle(rmask, (rx1 - rwx1, ry1 - rwy1), (rx2 - rwx1, ry2 - rwy1), 255, -1)
+            T_shift = np.array([[1, 0, -rwx1], [0, 1, -rwy1], [0, 0, 1]], dtype=np.float64)
+            T_shift_inv = np.linalg.inv(T_shift)
+            ecc_crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 1e-5)
+            refine = dict(n_ok=0, n_skip=0)
+            print(f"refine: patch ({rx1},{ry1})-({rx2},{ry2}) window {rww}x{rwh}", flush=True)
+
         enc = pick_encoder(preview=args.preview)
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
                "-f", "rawvideo", "-pix_fmt", "bgr24",
@@ -393,15 +419,40 @@ def main() -> None:
         for fi in range(N):
             ok, frame = cap.read()
             if not ok: break
-            out_M = (T_out @ np.vstack([Ms[fi], [0, 0, 1]]))[:2]
+            M3 = np.vstack([Ms[fi], [0, 0, 1]]).astype(np.float64)
+            if refine is not None and fi > 0:
+                # Coarse-align just the refine window, then ECC the residual.
+                win_M = (T_shift @ M3)[:2].astype(np.float32)
+                aligned_win = cv2.warpAffine(frame, win_M, (rww, rwh),
+                                             flags=cv2.INTER_LINEAR)
+                aligned_win = cv2.cvtColor(aligned_win, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+                wecc = np.eye(2, 3, dtype=np.float32)
+                try:
+                    cc, wecc = cv2.findTransformECC(tmpl_win, aligned_win, wecc,
+                                                    cv2.MOTION_EUCLIDEAN, ecc_crit, rmask, 5)
+                    resid = np.linalg.norm(wecc[:, 2])
+                    if np.isfinite(wecc).all() and cc > 0.4 and resid < 12:
+                        # forward residual (aligned -> frame0) = inv(wecc), in window
+                        # coords; conjugate back to full-frame coords and compose.
+                        R3 = T_shift_inv @ np.linalg.inv(np.vstack([wecc, [0, 0, 1]])) @ T_shift
+                        M3 = R3 @ M3
+                        refine["n_ok"] += 1
+                    else:
+                        refine["n_skip"] += 1
+                except cv2.error:
+                    refine["n_skip"] += 1
+            out_M = (T_out @ M3)[:2].astype(np.float32)
             stab = cv2.warpAffine(frame, out_M, (crop_w, crop_h),
                                   flags=cv2.INTER_CUBIC, borderMode=border_mode)
             proc.stdin.write(stab.tobytes())
             if fi % 200 == 0:
-                print(f"  render {fi}/{N}", flush=True)
+                extra = f" refine_ok={refine['n_ok']} skip={refine['n_skip']}" if refine else ""
+                print(f"  render {fi}/{N}{extra}", flush=True)
         cap.release()
         proc.stdin.close()
         proc.wait()
+        if refine:
+            print(f"refine: {refine['n_ok']} ok, {refine['n_skip']} skipped", flush=True)
         print(f"done -> {args.output}", flush=True)
         return
 
