@@ -24,17 +24,20 @@ import cv2
 import numpy as np
 
 
-def pick_encoder() -> list[str]:
-    """Prefer GPU encode; fall back to CPU x265."""
+def pick_encoder(preview: bool = False) -> list[str]:
+    """Prefer GPU encode; fall back to CPU x265. With preview=True, pick
+    the fastest available options (lower quality is fine)."""
     try:
         out = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
                              capture_output=True, text=True).stdout
     except FileNotFoundError:
         sys.exit("ffmpeg not found in PATH")
-    for enc in ("hevc_nvenc", "hevc_videotoolbox"):
-        if enc in out:
-            return ["-c:v", enc]
-    return ["-c:v", "libx265", "-preset", "fast"]
+    if "hevc_nvenc" in out:
+        return ["-c:v", "hevc_nvenc", "-preset", "p1" if preview else "p4"]
+    if "hevc_videotoolbox" in out:
+        # videotoolbox always runs at full speed; quality knob is bitrate.
+        return ["-c:v", "hevc_videotoolbox"]
+    return ["-c:v", "libx265", "-preset", "ultrafast" if preview else "fast"]
 
 
 def bird_mask(frame_shape, h5_path: Path | None, skip: int = 0):
@@ -74,7 +77,12 @@ def main() -> None:
     ap.add_argument("--crop_h", type=int, default=0, help="0 = source height")
     ap.add_argument("--offset_x", type=int, default=0)
     ap.add_argument("--offset_y", type=int, default=0)
-    ap.add_argument("--bitrate", default="50M")
+    ap.add_argument("--bitrate", default="10M",
+                    help="Output bitrate. Default 10M is good for previews; "
+                         "bump to 30-50M for final exports.")
+    ap.add_argument("--preview", action="store_true",
+                    help="Speed-first encoding for previews: lower bitrate, fast preset, "
+                         "1080p output. Overrides --bitrate.")
     ap.add_argument("--err_thresh", type=float, default=80.0,
                     help="Soft threshold — features above this for one frame are skipped that frame "
                          "but stay in the pool. Hard loss requires KLT status==0.")
@@ -145,7 +153,7 @@ def main() -> None:
         init_full = tracks[0, :, :2].astype(np.float32)
         print(f"loaded {P} tracks over {N} frames; vis_thresh={args.vis_thresh}", flush=True)
         # Output pipeline
-        enc = pick_encoder()
+        enc = pick_encoder(preview=args.preview)
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
                "-f", "rawvideo", "-pix_fmt", "bgr24",
                "-s", f"{crop_w}x{crop_h}", "-r", f"{fps}",
@@ -284,7 +292,7 @@ def main() -> None:
     init = pick.reshape(-1, 2).copy()
     print(f"{n_pick} features locked, ref_center=({ref_center_x:.0f},{ref_center_y:.0f}) crop {crop_w}x{crop_h}", flush=True)
 
-    enc = pick_encoder()
+    enc = pick_encoder(preview=args.preview)
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
            "-f", "rawvideo", "-pix_fmt", "bgr24",
            "-s", f"{crop_w}x{crop_h}", "-r", f"{fps}",

@@ -193,6 +193,18 @@ def run_dlc_stabl(job: jobs.Job) -> None:
     job.output_file_id = file_id
 
 
+def _add_klt_encode_flags(cmd: list, p: dict) -> None:
+    """Shared encode-side flags for klt_affine.py runs."""
+    if p.get("preview"):
+        cmd.append("--preview")
+    if p.get("bitrate"):
+        cmd += ["--bitrate", p["bitrate"]]
+    if p.get("no_rotation"):
+        cmd.append("--no_rotation")
+    if p.get("ransac_thresh") is not None:
+        cmd += ["--ransac_thresh", str(p["ransac_thresh"])]
+
+
 def run_cotracker_stabl(job: jobs.Job) -> None:
     """CoTracker3 tracking + affine warp. Tracks N points jointly via the
     transformer-based tracker (survives occlusion/wing flap), then runs the

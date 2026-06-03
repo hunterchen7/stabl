@@ -73,8 +73,10 @@ case "$cmd" in
     echo "downloading tracks..." >&2
     curl -fsS "${AUTH[@]}" -o "$tmp_json" "$BASE/v1/files/$oid"
     echo "warping locally..." >&2
+    # Default to --preview for the speed-first preset; caller can override
+    # by passing --bitrate explicitly.
     ~/Documents/GitHub/stabl/.venv/bin/python ~/Documents/GitHub/stabl/klt_affine.py \
-      --input "$src" --output "$out" --tracks_json "$tmp_json" "$@"
+      --input "$src" --output "$out" --tracks_json "$tmp_json" --preview "$@"
     rm -f "$tmp_json"
     echo "done -> $out" >&2 ;;
   *)       echo "usage: stabl {health|upload|upload-rsync|upload-r2|job|status|jobs|get|track-warp|restart|version|sync|check} ..." >&2; exit 2 ;;
