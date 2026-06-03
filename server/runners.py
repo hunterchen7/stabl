@@ -254,6 +254,11 @@ def run_cotracker_stabl(job: jobs.Job) -> None:
         cmd.append("--debug_overlay")
     if p.get("ransac_thresh") is not None:
         cmd += ["--ransac_thresh", str(p["ransac_thresh"])]
+    if p.get("auto_crop"):
+        cmd.append("--auto_crop")
+        cmd += ["--auto_crop_pct", str(p.get("auto_crop_pct", 2.0))]
+        cmd += ["--aspect", p.get("aspect", "16:9")]
+        cmd += ["--bias_x", str(p.get("bias_x", 0)), "--bias_y", str(p.get("bias_y", 0))]
     _run_subprocess(job, cmd)
     job.output_file_id = file_id
 

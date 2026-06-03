@@ -123,6 +123,17 @@ def main() -> None:
                     help="(tracks_json mode) Write the SOURCE video with each tracked "
                          "point drawn as a numbered circle. Don't stabilise — just show "
                          "what is being tracked.")
+    ap.add_argument("--auto_crop", action="store_true",
+                    help="(tracks_json) Size the crop to the largest border-safe rect at "
+                         "--auto_crop_pct, maximizing usable area.")
+    ap.add_argument("--auto_crop_pct", type=float, default=2.0,
+                    help="Percentile slack for auto_crop: ignore the worst this-%% of frames "
+                         "per edge (e.g. a brief takeoff lurch) when sizing the crop.")
+    ap.add_argument("--aspect", default="16:9", help="Aspect for --auto_crop.")
+    ap.add_argument("--bias_x", type=int, default=0,
+                    help="Shift the auto_crop window horizontally within the safe region.")
+    ap.add_argument("--bias_y", type=int, default=0,
+                    help="Shift the auto_crop window vertically (negative = up, toward bird).")
     ap.add_argument("--border", choices=["replicate", "constant", "shrink"], default="constant",
                     help="What to do when the stabilized crop goes past source edges. "
                          "shrink: pre-scan all frames and pick a crop size that never reveals "
@@ -250,32 +261,73 @@ def main() -> None:
             print(f"debug overlay -> {args.output}", flush=True)
             return
 
-        # Pre-scan: compute per-frame median displacement so we can size the crop
-        # to never reveal borders (when --border=shrink).
-        if args.border == "shrink":
-            shifts = []
-            for fi in range(N):
-                vis = tracks[fi, :, 2] >= args.vis_thresh
-                if vis.sum() < 3:
-                    continue
-                disp = tracks[fi, vis, :2] - init_full[vis]
-                shifts.append((float(np.median(disp[:, 0])), float(np.median(disp[:, 1]))))
-            if shifts:
-                arr = np.array(shifts)
-                max_dx = int(np.ceil(np.abs(arr[:, 0]).max()))
-                max_dy = int(np.ceil(np.abs(arr[:, 1]).max()))
-                # Shrink crop by 2*max so the warped frame always fully covers it.
-                new_w = max(64, crop_w - 2 * max_dx)
-                new_h = max(64, crop_h - 2 * max_dy)
-                if (new_w, new_h) != (crop_w, crop_h):
-                    print(f"shrink: max shift ({max_dx}, {max_dy}) -> crop {crop_w}x{crop_h} -> {new_w}x{new_h}", flush=True)
-                    crop_w, crop_h = new_w, new_h
-        border_mode = {
-            "replicate": cv2.BORDER_REPLICATE,
-            "constant": cv2.BORDER_CONSTANT,
-            "shrink": cv2.BORDER_CONSTANT,  # shouldn't matter after shrink
-        }[args.border]
-        # Output pipeline
+        # ---- Pass A: compute the stabilizing warp M (current->frame0) for every
+        # frame from the tracks alone (no video read). M is applied to a frame to
+        # bring its tracked points back to their frame-0 positions. ----
+        Ms = []
+        ident = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
+        last_M = ident.copy()
+        for fi in range(N):
+            if fi == 0:
+                Ms.append(ident.copy()); continue
+            visible = tracks[fi, :, 2] >= args.vis_thresh
+            cur = tracks[fi, :, :2].astype(np.float32)
+            if visible.sum() < 3:
+                Ms.append(last_M); continue
+            if args.no_rotation:
+                disp = init_full[visible] - cur[visible]   # cur -> frame0
+                M = np.array([[1, 0, float(np.median(disp[:, 0]))],
+                              [0, 1, float(np.median(disp[:, 1]))]], dtype=np.float32)
+            else:
+                M, _ = cv2.estimateAffinePartial2D(
+                    cur[visible], init_full[visible],
+                    method=cv2.RANSAC, ransacReprojThreshold=args.ransac_thresh,
+                    maxIters=2000, confidence=0.999)
+                if M is None:
+                    M = last_M
+            M = M.astype(np.float32)
+            Ms.append(M); last_M = M
+
+        # ---- Crop: border-safe region in stabilized (frame-0) space. A dst pixel
+        # is valid iff it lies in M @ (frame rect); the inner AABB per frame, taken
+        # at a percentile across frames, is the largest crop that stays border-free
+        # for (100 - 2*pct)% of frames (ignoring the worst few, e.g. the takeoff). ----
+        corners = np.array([[0, 0, 1], [W, 0, 1], [W, H, 1], [0, H, 1]], dtype=np.float32).T
+        Ls, Rs, Ts, Bs = [], [], [], []
+        for M in Ms:
+            q = (np.vstack([M, [0, 0, 1]]) @ corners)[:2].T   # 4x2 in dst space
+            tl, tr, br, bl = q
+            Ls.append(max(tl[0], bl[0])); Rs.append(min(tr[0], br[0]))
+            Ts.append(max(tl[1], tr[1])); Bs.append(min(bl[1], br[1]))
+        pct = args.auto_crop_pct
+        safe_l = max(0, np.percentile(Ls, pct))
+        safe_r = min(W, np.percentile(Rs, 100 - pct))
+        safe_t = max(0, np.percentile(Ts, pct))
+        safe_b = min(H, np.percentile(Bs, 100 - pct))
+        print(f"safe region (pct={pct}): x[{safe_l:.0f},{safe_r:.0f}] y[{safe_t:.0f},{safe_b:.0f}] "
+              f"= {safe_r - safe_l:.0f}x{safe_b - safe_t:.0f}", flush=True)
+
+        if args.auto_crop:
+            aw, ah = (int(v) for v in args.aspect.split(":"))
+            avail_w, avail_h = safe_r - safe_l, safe_b - safe_t
+            if avail_w / avail_h > aw / ah:
+                crop_h = int(avail_h); crop_w = int(crop_h * aw / ah)
+            else:
+                crop_w = int(avail_w); crop_h = int(crop_w * ah / aw)
+            crop_w -= crop_w % 2; crop_h -= crop_h % 2
+            cx = (safe_l + safe_r) / 2 + args.bias_x
+            cy = (safe_t + safe_b) / 2 + args.bias_y
+            cx0 = int(round(max(safe_l, min(cx - crop_w / 2, safe_r - crop_w))))
+            cy0 = int(round(max(safe_t, min(cy - crop_h / 2, safe_b - crop_h))))
+        else:
+            cx0 = int(ref_center_x - crop_w / 2)
+            cy0 = int(ref_center_y - crop_h / 2)
+        print(f"crop {crop_w}x{crop_h} at ({cx0},{cy0})", flush=True)
+
+        border_mode = cv2.BORDER_REPLICATE if args.border == "replicate" else cv2.BORDER_CONSTANT
+        T_out = np.array([[1, 0, -cx0], [0, 1, -cy0], [0, 0, 1]], dtype=np.float32)
+
+        # ---- Pass B: render. ----
         enc = pick_encoder(preview=args.preview)
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
                "-f", "rawvideo", "-pix_fmt", "bgr24",
@@ -289,43 +341,15 @@ def main() -> None:
                "-c:a", "aac", "-b:a", "192k", "-shortest", args.output]
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         assert proc.stdin
-        x1 = int(ref_center_x - crop_w / 2)
-        y1 = int(ref_center_y - crop_h / 2)
-        proc.stdin.write(frame0[y1:y1 + crop_h, x1:x1 + crop_w].tobytes())
-        T_out = np.array([[1, 0, crop_w / 2 - ref_center_x],
-                          [0, 1, crop_h / 2 - ref_center_y]], dtype=np.float32)
-        out_M = T_out.copy()
-        for fi in range(1, N):
+        for fi in range(N):
             ok, frame = cap.read()
             if not ok: break
-            visible = tracks[fi, :, 2] >= args.vis_thresh
-            cur = tracks[fi, :, :2].astype(np.float32)
-            if visible.sum() < 3:
-                stab = cv2.warpAffine(frame, out_M, (crop_w, crop_h),
-                                      flags=cv2.INTER_CUBIC, borderMode=border_mode)
-                proc.stdin.write(stab.tobytes())
-                if fi % 100 == 0:
-                    print(f"  {fi}/{N} ({int(visible.sum())} visible — holding last M)", flush=True)
-                continue
-            if args.no_rotation:
-                disp = cur[visible] - init_full[visible]
-                tx, ty = float(np.median(disp[:, 0])), float(np.median(disp[:, 1]))
-                M = np.array([[1, 0, tx], [0, 1, ty]], dtype=np.float32)
-            else:
-                M, _ = cv2.estimateAffinePartial2D(
-                    cur[visible], init_full[visible],
-                    method=cv2.RANSAC, ransacReprojThreshold=args.ransac_thresh,
-                    maxIters=2000, confidence=0.999)
-                if M is None:
-                    M = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
-            M3 = np.vstack([M, [0, 0, 1]])
-            T3 = np.vstack([T_out, [0, 0, 1]])
-            out_M = (T3 @ M3)[:2]
+            out_M = (T_out @ np.vstack([Ms[fi], [0, 0, 1]]))[:2]
             stab = cv2.warpAffine(frame, out_M, (crop_w, crop_h),
                                   flags=cv2.INTER_CUBIC, borderMode=border_mode)
             proc.stdin.write(stab.tobytes())
-            if fi % 100 == 0:
-                print(f"  {fi}/{N} ({int(visible.sum())}/{P} visible)", flush=True)
+            if fi % 200 == 0:
+                print(f"  render {fi}/{N}", flush=True)
         cap.release()
         proc.stdin.close()
         proc.wait()
