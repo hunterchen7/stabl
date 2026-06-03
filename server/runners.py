@@ -226,6 +226,10 @@ def run_cotracker_stabl(job: jobs.Job) -> None:
     ]
     if p.get("mask_circle"):
         cmd += ["--mask_circle", p["mask_circle"]]
+    if p.get("query_points"):
+        cmd += ["--query_points", p["query_points"]]
+    if p.get("expand_patch") is not None:
+        cmd += ["--expand_patch", str(p["expand_patch"])]
     _run_subprocess(job, cmd)
 
     file_id, out_path = _output_path()
@@ -244,6 +248,10 @@ def run_cotracker_stabl(job: jobs.Job) -> None:
     ]
     if p.get("no_rotation"):
         cmd.append("--no_rotation")
+    if p.get("no_consensus_filter"):
+        cmd.append("--no_consensus_filter")
+    if p.get("draw_debug"):
+        cmd.append("--debug_overlay")
     if p.get("ransac_thresh") is not None:
         cmd += ["--ransac_thresh", str(p["ransac_thresh"])]
     _run_subprocess(job, cmd)
