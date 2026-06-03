@@ -170,6 +170,15 @@ def main() -> None:
                     help="Path to a .cube 3D LUT (e.g. SV2 Look S-Log3->Rec709). Applied in the "
                          "encode in a float pipeline, output 10-bit p010 with dither to protect "
                          "smooth-sky gradients from banding.")
+    ap.add_argument("--read_bits", type=int, choices=[8, 16], default=8,
+                    help="8 = decode via OpenCV (8-bit, fast). 16 = decode the source as 16-bit "
+                         "(bgr48le) so the warp/downscale preserve 10-bit precision — no banding "
+                         "in smooth gradients. Use 16 for graded 10-bit sources / final exports.")
+    ap.add_argument("--x265", action="store_true",
+                    help="Encode with libx265 (software, slow, high quality 10-bit) instead of the "
+                         "HW encoder. Use for final exports; pairs with --read_bits 16.")
+    ap.add_argument("--x265_crf", type=int, default=16,
+                    help="CRF for --x265 (lower=better; 16 is near-transparent).")
     ap.add_argument("--bias_x", type=int, default=0,
                     help="Shift the auto_crop window horizontally within the safe region.")
     ap.add_argument("--bias_y", type=int, default=0,
@@ -533,21 +542,32 @@ def main() -> None:
             print(f"anchor(NCC): knot ({ax1},{ay1})-({ax2},{ay2}) window {awW}x{awH} "
                   f"search +/-{apad}px", flush=True)
 
-        enc = pick_encoder(preview=args.preview)
-        # Grade in-pass: float pipeline -> lut3d -> 10-bit p010 (smooth-sky safe).
+        # 16-bit pipeline: decode the source as bgr48le so the warp + downscale
+        # keep 10-bit precision (no banding in smooth sky); encode 10-bit out.
+        read16 = args.read_bits == 16
+        in_pix = "bgr48le" if read16 else "bgr24"
+        # Grade in-pass: float pipeline -> lut3d. Output 10-bit when grading or 16-bit reading.
+        ten_bit = read16 or bool(args.lut)
         if args.lut:
             lutp = args.lut.replace("\\", "/").replace(":", "\\:")
             vf = ["-vf", f"format=gbrpf32le,lut3d='{lutp}':interp=tetrahedral,format=p010le"]
             out_pix = "p010le"
         else:
             vf = []
-            out_pix = "yuv420p"
+            out_pix = "p010le" if ten_bit else "yuv420p"
+        if args.x265:
+            enc = ["-c:v", "libx265", "-preset", "slow",
+                   "-crf", str(args.x265_crf), "-x265-params", "profile=main10:log-level=error"]
+            rate = []
+        else:
+            enc = pick_encoder(preview=args.preview)
+            rate = ["-b:v", args.bitrate]
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
-               "-f", "rawvideo", "-pix_fmt", "bgr24",
+               "-f", "rawvideo", "-pix_fmt", in_pix,
                "-s", f"{out_w}x{out_h}", "-r", f"{fps}",
                "-i", "-", "-i", args.input,
                "-map", "0:v", "-map", "1:a?", *vf,
-               *enc, "-b:v", args.bitrate, "-tag:v", "hvc1",
+               *enc, *rate, "-tag:v", "hvc1",
                "-pix_fmt", out_pix,
                "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
                "-bsf:v", "hevc_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1",
@@ -555,10 +575,26 @@ def main() -> None:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
         assert proc.stdin
         cap.release()
-        cap = cv2.VideoCapture(args.input)   # rewind: frame0 was consumed at top of main()
+        # Frame source: a raw ffmpeg decoder for 16-bit, else OpenCV.
+        dec = None
+        if read16:
+            frame_bytes = W * H * 3 * 2
+            dec = subprocess.Popen(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", args.input,
+                 "-f", "rawvideo", "-pix_fmt", "bgr48le", "-"],
+                stdout=subprocess.PIPE, bufsize=frame_bytes)
+        else:
+            cap = cv2.VideoCapture(args.input)   # rewind: frame0 consumed at top of main()
         for fi in range(N):
-            ok, frame = cap.read()
-            if not ok: break
+            if read16:
+                buf = dec.stdout.read(frame_bytes)
+                if len(buf) < frame_bytes: break
+                frame = np.frombuffer(buf, np.uint16).reshape(H, W, 3)
+                gray8 = cv2.cvtColor((frame >> 8).astype(np.uint8), cv2.COLOR_BGR2GRAY)
+            else:
+                ok, frame = cap.read()
+                if not ok: break
+                gray8 = None
             M3 = np.vstack([Ms[fi], [0, 0, 1]]).astype(np.float64)
             if refine is not None and fi > 0:
                 # Coarse-align just the refine window with the track warp, then
@@ -567,8 +603,11 @@ def main() -> None:
                 # the lock is sub-pixel. Coarse-to-fine so it captures big (~60px)
                 # residuals that a single full-res ECC pass would miss.
                 win_M = (T_shift @ M3)[:2].astype(np.float32)
-                aligned_win = cv2.warpAffine(frame, win_M, (rww, rwh), flags=cv2.INTER_LINEAR)
-                aligned_win = cv2.cvtColor(aligned_win, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+                if read16:
+                    aligned_win = cv2.warpAffine(gray8, win_M, (rww, rwh), flags=cv2.INTER_LINEAR).astype(np.float32) / 255.0
+                else:
+                    aligned_win = cv2.cvtColor(cv2.warpAffine(frame, win_M, (rww, rwh), flags=cv2.INTER_LINEAR),
+                                               cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
                 wecc = np.eye(2, 3, dtype=np.float32)
                 ok_ecc = False; cc = 0.0
                 for sclvl in (0.25, 0.5, 1.0):
@@ -590,8 +629,11 @@ def main() -> None:
                     refine["n_skip"] += 1
             if anchor is not None and fi > 0:
                 win_M = (T_shift_a @ M3)[:2].astype(np.float32)
-                aligned = cv2.warpAffine(frame, win_M, (awW, awH), flags=cv2.INTER_LINEAR)
-                aligned = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY).astype(np.float32)
+                if read16:   # warp the 8-bit gray (consistent range with the template)
+                    aligned = cv2.warpAffine(gray8, win_M, (awW, awH), flags=cv2.INTER_LINEAR).astype(np.float32)
+                else:
+                    aligned = cv2.cvtColor(cv2.warpAffine(frame, win_M, (awW, awH), flags=cv2.INTER_LINEAR),
+                                           cv2.COLOR_BGR2GRAY).astype(np.float32)
                 res = cv2.matchTemplate(aligned, anchor_tmpl, cv2.TM_CCOEFF_NORMED)
                 _, mx, _, mloc = cv2.minMaxLoc(res)
                 if mx >= args.anchor_min_cc:
@@ -621,7 +663,10 @@ def main() -> None:
             if fi % 200 == 0:
                 extra = f" refine_ok={refine['n_ok']} skip={refine['n_skip']}" if refine else ""
                 print(f"  render {fi}/{N}{extra}", flush=True)
-        cap.release()
+        if dec is not None:
+            dec.stdout.close(); dec.wait()
+        else:
+            cap.release()
         proc.stdin.close()
         proc.wait()
         if refine:
