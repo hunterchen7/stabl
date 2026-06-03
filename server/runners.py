@@ -273,6 +273,8 @@ def run_cotracker_track(job: jobs.Job) -> None:
         cmd += ["--mask_circle", p["mask_circle"]]
     if p.get("query_points"):
         cmd += ["--query_points", p["query_points"]]
+    if p.get("expand_patch") is not None:
+        cmd += ["--expand_patch", str(p["expand_patch"])]
     _run_subprocess(job, cmd)
     job.output_file_id = file_id
 

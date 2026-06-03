@@ -40,6 +40,10 @@ def main() -> None:
                     help="Semicolon-separated explicit query coords in SOURCE resolution: "
                          "'x1,y1;x2,y2;...'. Skips goodFeaturesToTrack and tracks exactly "
                          "these points instead. For manual selection.")
+    ap.add_argument("--expand_patch", type=int, default=0,
+                    help="If >0, each query point gets expanded into a 3x3 grid of points "
+                         "with this radius (pixels in source). Lets a single user-picked "
+                         "location yield rotation/scale info via relative motion.")
     args = ap.parse_args()
 
     import torch
@@ -78,6 +82,15 @@ def main() -> None:
             [float(x), float(y)]
             for x, y in (chunk.split(",") for chunk in args.query_points.split(";"))
         ])
+        if args.expand_patch > 0:
+            r = args.expand_patch
+            grid = []
+            for cx, cy in pts_src:
+                for dy in (-r, 0, r):
+                    for dx in (-r, 0, r):
+                        grid.append([cx + dx, cy + dy])
+            pts_src = np.array(grid)
+            print(f"expanded {len(pts_src)//9} centers into {len(pts_src)} grid points (r={r})", flush=True)
         pts = pts_src * scale  # to tracking coords
         P = len(pts)
         queries = torch.zeros(1, P, 3, device="cuda")
