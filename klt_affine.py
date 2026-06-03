@@ -112,6 +112,11 @@ def main() -> None:
                          "where to trim).")
     ap.add_argument("--auto_pick_pool", type=int, default=200,
                     help="Number of candidate features for --auto_pick first pass.")
+    ap.add_argument("--border", choices=["replicate", "constant", "shrink"], default="shrink",
+                    help="What to do when the stabilized crop goes past source edges. "
+                         "shrink: pre-scan all frames and pick a crop size that never reveals "
+                         "borders (cleanest). constant: black borders. replicate: stretch "
+                         "outermost pixel (causes smearing).")
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.input)
@@ -152,6 +157,32 @@ def main() -> None:
         # Use frame 0 visible points as the "init" set
         init_full = tracks[0, :, :2].astype(np.float32)
         print(f"loaded {P} tracks over {N} frames; vis_thresh={args.vis_thresh}", flush=True)
+
+        # Pre-scan: compute per-frame median displacement so we can size the crop
+        # to never reveal borders (when --border=shrink).
+        if args.border == "shrink":
+            shifts = []
+            for fi in range(N):
+                vis = tracks[fi, :, 2] >= args.vis_thresh
+                if vis.sum() < 3:
+                    continue
+                disp = tracks[fi, vis, :2] - init_full[vis]
+                shifts.append((float(np.median(disp[:, 0])), float(np.median(disp[:, 1]))))
+            if shifts:
+                arr = np.array(shifts)
+                max_dx = int(np.ceil(np.abs(arr[:, 0]).max()))
+                max_dy = int(np.ceil(np.abs(arr[:, 1]).max()))
+                # Shrink crop by 2*max so the warped frame always fully covers it.
+                new_w = max(64, crop_w - 2 * max_dx)
+                new_h = max(64, crop_h - 2 * max_dy)
+                if (new_w, new_h) != (crop_w, crop_h):
+                    print(f"shrink: max shift ({max_dx}, {max_dy}) -> crop {crop_w}x{crop_h} -> {new_w}x{new_h}", flush=True)
+                    crop_w, crop_h = new_w, new_h
+        border_mode = {
+            "replicate": cv2.BORDER_REPLICATE,
+            "constant": cv2.BORDER_CONSTANT,
+            "shrink": cv2.BORDER_CONSTANT,  # shouldn't matter after shrink
+        }[args.border]
         # Output pipeline
         enc = pick_encoder(preview=args.preview)
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
@@ -179,7 +210,7 @@ def main() -> None:
             cur = tracks[fi, :, :2].astype(np.float32)
             if visible.sum() < 3:
                 stab = cv2.warpAffine(frame, out_M, (crop_w, crop_h),
-                                      flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                                      flags=cv2.INTER_CUBIC, borderMode=border_mode)
                 proc.stdin.write(stab.tobytes())
                 if fi % 100 == 0:
                     print(f"  {fi}/{N} ({int(visible.sum())} visible — holding last M)", flush=True)
@@ -199,7 +230,7 @@ def main() -> None:
             T3 = np.vstack([T_out, [0, 0, 1]])
             out_M = (T3 @ M3)[:2]
             stab = cv2.warpAffine(frame, out_M, (crop_w, crop_h),
-                                  flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                                  flags=cv2.INTER_CUBIC, borderMode=border_mode)
             proc.stdin.write(stab.tobytes())
             if fi % 100 == 0:
                 print(f"  {fi}/{N} ({int(visible.sum())}/{P} visible)", flush=True)
@@ -313,6 +344,12 @@ def main() -> None:
     prev_gray = gray0
     prev_pts = pick.copy()
     active = np.ones(n_pick, dtype=bool)
+    # Border mode for the KLT branch (the tracks_json branch sets its own above).
+    border_mode = {
+        "replicate": cv2.BORDER_REPLICATE,
+        "constant": cv2.BORDER_CONSTANT,
+        "shrink": cv2.BORDER_CONSTANT,
+    }[args.border]
 
     x1 = int(ref_center_x - crop_w / 2)
     y1 = int(ref_center_y - crop_h / 2)
@@ -336,7 +373,7 @@ def main() -> None:
             prev_gray = gray
             prev_pts = next_pts
             stab = cv2.warpAffine(frame, out_M, (crop_w, crop_h),
-                                  flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                                  flags=cv2.INTER_CUBIC, borderMode=border_mode)
             proc.stdin.write(stab.tobytes())
             if fi % 100 == 0:
                 print(f"  {fi}/{N} ({eligible.sum()}/{active.sum()} eligible — holding last M)", flush=True)
@@ -361,7 +398,7 @@ def main() -> None:
         T3 = np.vstack([T_out, [0, 0, 1]])
         out_M = (T3 @ M3)[:2]
         stab = cv2.warpAffine(frame, out_M, (crop_w, crop_h),
-                              flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                              flags=cv2.INTER_CUBIC, borderMode=border_mode)
         proc.stdin.write(stab.tobytes())
         prev_gray = gray
         prev_pts = next_pts
