@@ -112,6 +112,13 @@ def main() -> None:
                          "where to trim).")
     ap.add_argument("--auto_pick_pool", type=int, default=200,
                     help="Number of candidate features for --auto_pick first pass.")
+    ap.add_argument("--consensus_filter", action="store_true", default=True,
+                    help="(tracks_json mode) Drop tracks that disagree with the rigid-body "
+                         "motion via per-frame RANSAC voting. Default ON. Catches features "
+                         "that ended up on the bird / a moving object.")
+    ap.add_argument("--no_consensus_filter", dest="consensus_filter", action="store_false")
+    ap.add_argument("--consensus_min_rate", type=float, default=0.5,
+                    help="Minimum per-track RANSAC-inlier rate to keep the track.")
     ap.add_argument("--border", choices=["replicate", "constant", "shrink"], default="shrink",
                     help="What to do when the stabilized crop goes past source edges. "
                          "shrink: pre-scan all frames and pick a crop size that never reveals "
@@ -157,6 +164,40 @@ def main() -> None:
         # Use frame 0 visible points as the "init" set
         init_full = tracks[0, :, :2].astype(np.float32)
         print(f"loaded {P} tracks over {N} frames; vis_thresh={args.vis_thresh}", flush=True)
+
+        # Consensus filter: per-frame RANSAC inlier rate per track. Tracks that
+        # disagree with the rigid-body motion (the bird flying away, a leaf
+        # moving in wind) get rejected before the warp pass.
+        if args.consensus_filter:
+            inlier_count = np.zeros(P, dtype=np.int32)
+            visible_count = np.zeros(P, dtype=np.int32)
+            for fi in range(1, N):
+                vis = tracks[fi, :, 2] >= args.vis_thresh
+                visible_count += vis.astype(np.int32)
+                if vis.sum() < 4:
+                    continue
+                cur = tracks[fi, vis, :2].astype(np.float32)
+                src = init_full[vis]
+                _, inl = cv2.estimateAffinePartial2D(
+                    cur, src, method=cv2.RANSAC,
+                    ransacReprojThreshold=args.ransac_thresh,
+                    maxIters=500, confidence=0.99)
+                if inl is None:
+                    continue
+                inl = inl.flatten().astype(bool)
+                idx = np.where(vis)[0]
+                inlier_count[idx[inl]] += 1
+            rate = inlier_count / np.maximum(visible_count, 1)
+            keep = rate >= args.consensus_min_rate
+            if keep.sum() >= 4:
+                dropped = (~keep).sum()
+                print(f"consensus_filter: kept {keep.sum()}/{P} (median inlier rate {np.median(rate[keep]):.2f}); "
+                      f"dropped {dropped} outliers (median outlier rate {np.median(rate[~keep]) if dropped else 0:.2f})", flush=True)
+                tracks = tracks[:, keep, :]
+                init_full = init_full[keep]
+                P = int(keep.sum())
+            else:
+                print(f"consensus_filter: only {keep.sum()} survive, falling back to no filter", flush=True)
 
         # Pre-scan: compute per-frame median displacement so we can size the crop
         # to never reveal borders (when --border=shrink).
