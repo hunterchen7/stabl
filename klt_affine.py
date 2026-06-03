@@ -299,11 +299,15 @@ def main() -> None:
             tl, tr, br, bl = q
             Ls.append(max(tl[0], bl[0])); Rs.append(min(tr[0], br[0]))
             Ts.append(max(tl[1], tr[1])); Bs.append(min(bl[1], br[1]))
+        # For a crop edge to be border-safe on (100-pct)% of frames: the left/top
+        # must sit at the *high* percentile of per-frame left/top edges, and the
+        # right/bottom at the *low* percentile of right/bottom edges. (Getting these
+        # sides backwards yields the full frame — i.e. no crop.)
         pct = args.auto_crop_pct
-        safe_l = max(0, np.percentile(Ls, pct))
-        safe_r = min(W, np.percentile(Rs, 100 - pct))
-        safe_t = max(0, np.percentile(Ts, pct))
-        safe_b = min(H, np.percentile(Bs, 100 - pct))
+        safe_l = max(0, np.percentile(Ls, 100 - pct))
+        safe_r = min(W, np.percentile(Rs, pct))
+        safe_t = max(0, np.percentile(Ts, 100 - pct))
+        safe_b = min(H, np.percentile(Bs, pct))
         print(f"safe region (pct={pct}): x[{safe_l:.0f},{safe_r:.0f}] y[{safe_t:.0f},{safe_b:.0f}] "
               f"= {safe_r - safe_l:.0f}x{safe_b - safe_t:.0f}", flush=True)
 
