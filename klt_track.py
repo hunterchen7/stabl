@@ -24,27 +24,33 @@ import cv2
 import numpy as np
 
 
-def similarity_fit(src, dst):
+def similarity_fit(src, dst, rigid=False):
+    """Fit src->dst. rigid=False: rotation + uniform scale + translation.
+    rigid=True: rotation + translation only (scale forced to 1) — prevents
+    apparent zoom/resizing when the feature set gets disturbed."""
     src_m = src.mean(0); dst_m = dst.mean(0)
     sc = src - src_m; dc = dst - dst_m
     Hc = (sc.T @ dc) / max(len(src), 1)
     U, S, Vt = np.linalg.svd(Hc)
     d = 1.0 if np.linalg.det(Vt.T @ U.T) > 0 else -1.0
     R = Vt.T @ np.diag([1.0, d]) @ U.T
-    var = (sc ** 2).sum() / max(len(src), 1)
-    s = (S @ np.array([1.0, d])) / var if var > 1e-9 else 1.0
+    if rigid:
+        s = 1.0
+    else:
+        var = (sc ** 2).sum() / max(len(src), 1)
+        s = (S @ np.array([1.0, d])) / var if var > 1e-9 else 1.0
     t = dst_m - s * (R @ src_m)
     M = np.eye(3); M[:2, :2] = s * R; M[:2, 2] = t
     return M
 
 
-def robust_fit(src, dst):
-    M = similarity_fit(src, dst)
+def robust_fit(src, dst, rigid=False):
+    M = similarity_fit(src, dst, rigid)
     proj = (M[:2, :2] @ src.T).T + M[:2, 2]
     res = np.linalg.norm(proj - dst, axis=1)
     keep = res <= max(3.0 * np.median(res), 1.0)
     if 3 <= keep.sum() < len(src):
-        M = similarity_fit(src[keep], dst[keep])
+        M = similarity_fit(src[keep], dst[keep], rigid)
         proj = (M[:2, :2] @ src.T).T + M[:2, 2]
         res = np.linalg.norm(proj - dst, axis=1)
     return M, res
@@ -63,6 +69,15 @@ def main() -> None:
                     help="Drop a feature whose fit residual exceeds this (px).")
     ap.add_argument("--reseed_min", type=int, default=30,
                     help="Re-detect features when the live count drops below this.")
+    ap.add_argument("--rigid", action="store_true",
+                    help="Rotation+translation only (no scale) — prevents apparent zoom.")
+    ap.add_argument("--max_jump", type=float, default=40.0,
+                    help="If the fitted warp's translation jumps more than this (px) from "
+                         "the previous frame, treat as wing-capture and HOLD.")
+    ap.add_argument("--min_fit", type=int, default=6,
+                    help="If fewer than this many features survive LK, HOLD.")
+    ap.add_argument("--bootstrap", type=int, default=8,
+                    help="Accept the first this-many frames unconditionally (seed velocity).")
     args = ap.parse_args()
 
     bx1, by1, bx2, by2 = (int(v) for v in args.feature_bbox.split(","))
@@ -98,45 +113,53 @@ def main() -> None:
           f"({bx1},{by1})-({bx2},{by2}), {len(cur)} seed features", flush=True)
 
     A = np.eye(3)
+    A_prev = np.eye(3)              # for constant-velocity prediction
     warps = [A[:2].astype(np.float32).copy()]
     prev_gray = gray0
     n_reseed = 0
+    n_held = 0
     for fi in range(1, N):
         ok, frame = cap.read()
         if not ok:
             break
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # Replenish features BEFORE tracking so the pool never empties.
+        if len(cur) < args.reseed_min:
+            p = detect_in_stick(prev_gray, A)
+            if p is not None and len(p) >= 4:
+                newc = p.reshape(-1, 2).astype(np.float32)
+                pr = (A[:2, :2] @ newc.T).T + A[:2, 2]
+                inb = (pr[:, 0] >= bx1) & (pr[:, 0] <= bx2) & (pr[:, 1] >= by1) & (pr[:, 1] <= by2)
+                if inb.sum() >= 4:
+                    cur = np.vstack([cur, newc[inb]]) if len(cur) else newc[inb]
+                    ref = np.vstack([ref, pr[inb]]) if len(ref) else pr[inb]
+                    n_reseed += 1
+        if len(cur) < 3:
+            warps.append(A[:2].astype(np.float32).copy()); prev_gray = gray; n_held += 1
+            continue
         nxt, st, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray, cur.reshape(-1, 1, 2), None, **lk)
         back, _, _ = cv2.calcOpticalFlowPyrLK(gray, prev_gray, nxt, None, **lk)
         fb = np.linalg.norm((back.reshape(-1, 2) - cur), axis=1)
         st = st.flatten()
         good = (st == 1) & (fb < args.bidir_thresh)
         nxt = nxt.reshape(-1, 2)
-        if good.sum() >= 3:
-            M, res = robust_fit(nxt[good], ref[good])   # cur -> frame0
-            A = M
-            # Keep features that survived LK AND agree with the fit.
-            keep_full = good.copy()
-            gi = np.where(good)[0]
-            keep_full[gi[res > args.max_resid]] = False
-            cur = nxt[keep_full]
-            ref = ref[keep_full]
-        else:
-            cur = nxt[good]; ref = ref[good]   # fit held (A unchanged)
-        warps.append(A[:2].astype(np.float32).copy())
 
-        if len(cur) < args.reseed_min:
-            p = detect_in_stick(gray, A)
-            if p is not None and len(p) >= 4:
-                newc = p.reshape(-1, 2).astype(np.float32)
-                # frame-0 reference of each new feature = A applied to its position
-                newr = (A[:2, :2] @ newc.T).T + A[:2, 2]
-                cur = np.vstack([cur, newc]); ref = np.vstack([ref, newr])
-                n_reseed += 1
+        # Simple: fit from LK-survivors (drift-free, frame-0 referenced). Occlusion
+        # spikes are repaired afterward by the post-process deglitch, not here.
+        if good.sum() >= 3:
+            M, res = robust_fit(nxt[good], ref[good], args.rigid)   # cur -> frame0
+            A = M
+            keep = good.copy()
+            gi = np.where(good)[0]
+            keep[gi[res > args.max_resid]] = False
+            cur = nxt[keep]; ref = ref[keep]
+        else:
+            cur = nxt[good]; ref = ref[good]   # A held
+        warps.append(A[:2].astype(np.float32).copy())
         prev_gray = gray
         if fi % 200 == 0:
-            rmed = float(np.median(res)) if good.sum() >= 3 else -1
-            print(f"  {fi}/{N} feats={len(cur)} reseeds={n_reseed} fit_resid_med={rmed:.2f}px", flush=True)
+            print(f"  {fi}/{N} feats={len(cur)} reseeds={n_reseed} held={n_held} "
+                  f"good={int(good.sum())}", flush=True)
 
     cap.release()
     out = {"width": W, "height": H, "fps": float(fps), "n_frames": len(warps),
@@ -144,7 +167,7 @@ def main() -> None:
     Path(args.output_json).parent.mkdir(parents=True, exist_ok=True)
     with open(args.output_json, "w") as f:
         json.dump(out, f)
-    print(f"done -> {args.output_json} ({len(warps)} warps, {n_reseed} re-seeds)", flush=True)
+    print(f"done -> {args.output_json} ({len(warps)} warps, {n_reseed} re-seeds, {n_held} held)", flush=True)
 
 
 if __name__ == "__main__":

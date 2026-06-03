@@ -109,6 +109,12 @@ def main() -> None:
     ap.add_argument("--vis_thresh", type=float, default=0.7,
                     help="Visibility threshold for using a point in the RANSAC fit "
                          "when tracks_json is provided.")
+    ap.add_argument("--deglitch", type=float, default=0,
+                    help="(tracks/warps) Flag frames whose warp translation deviates more "
+                         "than this many px from its median-filtered trajectory (occlusion "
+                         "spikes) and replace them by interpolation. 0=off; try 40.")
+    ap.add_argument("--deglitch_win", type=int, default=21,
+                    help="Median-filter window for --deglitch.")
     ap.add_argument("--warp_smooth", type=int, default=0,
                     help="(tracks_json) Moving-average window over the per-frame warp to "
                          "remove residual estimation jitter. Safe for a static lock (no lag). "
@@ -360,6 +366,43 @@ def main() -> None:
             print(f"fit: {int(good_fit.sum())}/{N} frames direct, {n_interp} interpolated, "
                   f"{N - int(good_fit.sum()) - n_interp} held", flush=True)
 
+        # Deglitch: detect frames where the warp spikes away from its robust
+        # (median-filtered) trajectory — these are occlusion captures (the wing
+        # dragging the fit). Real camera motion stays near the median; a wing
+        # spike (100px+) is far. Replace flagged frames by linear interpolation
+        # between the nearest clean frames.
+        if args.deglitch > 0:
+            arr = np.stack(Ms).astype(np.float64)          # [N,2,3]
+            txy = arr[:, :, 2]                              # [N,2]
+            k = args.deglitch_win | 1                       # odd window
+            pad = k // 2
+            padded = np.pad(txy, ((pad, pad), (0, 0)), mode="edge")
+            medt = np.stack([np.median(padded[i:i + k], axis=0) for i in range(N)])
+            dev = np.linalg.norm(txy - medt, axis=1)
+            bad = dev > args.deglitch
+            # also flag a few frames around each spike (capture ramps in/out)
+            badi = np.where(bad)[0]
+            for b in badi:
+                bad[max(0, b - 2):min(N, b + 3)] = True
+            goodi = np.where(~bad)[0]
+            n_fix = 0
+            if len(goodi) >= 2:
+                for a, c in zip(goodi[:-1], goodi[1:]):
+                    if c - a <= 1:
+                        continue
+                    Ma, Mc = Ms[a], Ms[c]
+                    angA = np.arctan2(Ma[1, 0], Ma[0, 0]); angC = np.arctan2(Mc[1, 0], Mc[0, 0])
+                    for fi in range(a + 1, c):
+                        t = (fi - a) / (c - a)
+                        ang = angA + t * (angC - angA)
+                        tx = Ma[0, 2] + t * (Mc[0, 2] - Ma[0, 2])
+                        ty = Ma[1, 2] + t * (Mc[1, 2] - Ma[1, 2])
+                        Ms[fi] = np.array([[np.cos(ang), -np.sin(ang), tx],
+                                           [np.sin(ang), np.cos(ang), ty]], dtype=np.float32)
+                        n_fix += 1
+            print(f"deglitch: {int(bad.sum())} frames flagged (dev>{args.deglitch}px), "
+                  f"{n_fix} interpolated", flush=True)
+
         # Optional light temporal smoothing of the warp to remove residual
         # per-frame estimation jitter (safe for a static lock — no subject lag).
         if args.warp_smooth > 1:
@@ -460,25 +503,32 @@ def main() -> None:
             if not ok: break
             M3 = np.vstack([Ms[fi], [0, 0, 1]]).astype(np.float64)
             if refine is not None and fi > 0:
-                # Coarse-align just the refine window, then ECC the residual.
+                # Coarse-align just the refine window with the track warp, then
+                # ECC the residual against frame 0 — re-anchors absolutely, so any
+                # coarse drift (incl. re-seed reference drift) is corrected, and
+                # the lock is sub-pixel. Coarse-to-fine so it captures big (~60px)
+                # residuals that a single full-res ECC pass would miss.
                 win_M = (T_shift @ M3)[:2].astype(np.float32)
-                aligned_win = cv2.warpAffine(frame, win_M, (rww, rwh),
-                                             flags=cv2.INTER_LINEAR)
+                aligned_win = cv2.warpAffine(frame, win_M, (rww, rwh), flags=cv2.INTER_LINEAR)
                 aligned_win = cv2.cvtColor(aligned_win, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
                 wecc = np.eye(2, 3, dtype=np.float32)
-                try:
-                    cc, wecc = cv2.findTransformECC(tmpl_win, aligned_win, wecc,
-                                                    cv2.MOTION_EUCLIDEAN, ecc_crit, rmask, 5)
-                    resid = np.linalg.norm(wecc[:, 2])
-                    if np.isfinite(wecc).all() and cc > 0.4 and resid < 12:
-                        # forward residual (aligned -> frame0) = inv(wecc), in window
-                        # coords; conjugate back to full-frame coords and compose.
-                        R3 = T_shift_inv @ np.linalg.inv(np.vstack([wecc, [0, 0, 1]])) @ T_shift
-                        M3 = R3 @ M3
-                        refine["n_ok"] += 1
-                    else:
-                        refine["n_skip"] += 1
-                except cv2.error:
+                ok_ecc = False; cc = 0.0
+                for sclvl in (0.25, 0.5, 1.0):
+                    tl = tmpl_win if sclvl == 1.0 else cv2.resize(tmpl_win, None, fx=sclvl, fy=sclvl)
+                    al = aligned_win if sclvl == 1.0 else cv2.resize(aligned_win, None, fx=sclvl, fy=sclvl)
+                    ml = rmask if sclvl == 1.0 else cv2.resize(rmask, None, fx=sclvl, fy=sclvl, interpolation=cv2.INTER_NEAREST)
+                    w = wecc.copy(); w[:, 2] *= sclvl
+                    try:
+                        cc, w = cv2.findTransformECC(tl, al, w, cv2.MOTION_EUCLIDEAN, ecc_crit, ml, 5)
+                        w[:, 2] /= sclvl
+                        wecc = w; ok_ecc = True
+                    except cv2.error:
+                        ok_ecc = False; break
+                if ok_ecc and np.isfinite(wecc).all() and cc > 0.4:
+                    R3 = T_shift_inv @ np.linalg.inv(np.vstack([wecc, [0, 0, 1]])) @ T_shift
+                    M3 = R3 @ M3
+                    refine["n_ok"] += 1
+                else:
                     refine["n_skip"] += 1
             out_M = (T_out @ M3)[:2].astype(np.float32)
             stab = cv2.warpAffine(frame, out_M, (crop_w, crop_h),
