@@ -119,6 +119,10 @@ def main() -> None:
     ap.add_argument("--no_consensus_filter", dest="consensus_filter", action="store_false")
     ap.add_argument("--consensus_min_rate", type=float, default=0.5,
                     help="Minimum per-track RANSAC-inlier rate to keep the track.")
+    ap.add_argument("--debug_overlay", action="store_true",
+                    help="(tracks_json mode) Write the SOURCE video with each tracked "
+                         "point drawn as a numbered circle. Don't stabilise — just show "
+                         "what is being tracked.")
     ap.add_argument("--border", choices=["replicate", "constant", "shrink"], default="shrink",
                     help="What to do when the stabilized crop goes past source edges. "
                          "shrink: pre-scan all frames and pick a crop size that never reveals "
@@ -198,6 +202,53 @@ def main() -> None:
                 P = int(keep.sum())
             else:
                 print(f"consensus_filter: only {keep.sum()} survive, falling back to no filter", flush=True)
+
+        if args.debug_overlay:
+            # Write source-sized video with numbered circles at tracked positions.
+            # No stabilisation, just visual debugging.
+            enc = pick_encoder(preview=True)
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
+                   "-f", "rawvideo", "-pix_fmt", "bgr24",
+                   "-s", f"{W}x{H}", "-r", f"{fps}", "-i", "-",
+                   "-i", args.input, "-map", "0:v", "-map", "1:a?",
+                   *enc, "-b:v", args.bitrate, "-tag:v", "hvc1",
+                   "-pix_fmt", "yuv420p",
+                   "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
+                   "-bsf:v", "hevc_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1",
+                   "-c:a", "aac", "-b:a", "192k", "-shortest", args.output]
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+            assert proc.stdin
+            # Distinct colors per index
+            rng = np.random.default_rng(0)
+            colors = (rng.uniform(60, 255, size=(P, 3))).astype(int).tolist()
+            # First frame
+            f0 = frame0.copy()
+            for pi in range(P):
+                vis = tracks[0, pi, 2] >= args.vis_thresh
+                x, y = int(tracks[0, pi, 0]), int(tracks[0, pi, 1])
+                col = colors[pi] if vis else (60, 60, 60)
+                cv2.circle(f0, (x, y), 18, col, 3)
+                cv2.putText(f0, str(pi), (x + 22, y + 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1.0, col, 2)
+            proc.stdin.write(f0.tobytes())
+            for fi in range(1, N):
+                ok, frame = cap.read()
+                if not ok: break
+                for pi in range(P):
+                    vis = tracks[fi, pi, 2] >= args.vis_thresh
+                    x, y = int(tracks[fi, pi, 0]), int(tracks[fi, pi, 1])
+                    col = colors[pi] if vis else (60, 60, 60)
+                    cv2.circle(frame, (x, y), 18, col, 3)
+                    cv2.putText(frame, str(pi), (x + 22, y + 8),
+                                cv2.FONT_HERSHEY_SIMPLEX, 1.0, col, 2)
+                proc.stdin.write(frame.tobytes())
+                if fi % 100 == 0:
+                    print(f"  {fi}/{N} (debug overlay)", flush=True)
+            cap.release()
+            proc.stdin.close()
+            proc.wait()
+            print(f"debug overlay -> {args.output}", flush=True)
+            return
 
         # Pre-scan: compute per-frame median displacement so we can size the crop
         # to never reveal borders (when --border=shrink).
