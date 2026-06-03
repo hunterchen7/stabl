@@ -160,6 +160,16 @@ def main() -> None:
                     help="Percentile slack for auto_crop: ignore the worst this-%% of frames "
                          "per edge (e.g. a brief takeoff lurch) when sizing the crop.")
     ap.add_argument("--aspect", default="16:9", help="Aspect for --auto_crop.")
+    ap.add_argument("--crop_rect", default=None,
+                    help="x0,y0,w,h source px — explicit crop rectangle (overrides --auto_crop). "
+                         "Use a rotation-aware black-free rect computed offline; combine with "
+                         "--out_w/--out_h to downscale (zoom out) to a standard output size.")
+    ap.add_argument("--out_w", type=int, default=0, help="Output width (downscale crop_rect). 0=crop width.")
+    ap.add_argument("--out_h", type=int, default=0, help="Output height. 0=crop height.")
+    ap.add_argument("--lut", default=None,
+                    help="Path to a .cube 3D LUT (e.g. SV2 Look S-Log3->Rec709). Applied in the "
+                         "encode in a float pipeline, output 10-bit p010 with dither to protect "
+                         "smooth-sky gradients from banding.")
     ap.add_argument("--bias_x", type=int, default=0,
                     help="Shift the auto_crop window horizontally within the safe region.")
     ap.add_argument("--bias_y", type=int, default=0,
@@ -452,7 +462,9 @@ def main() -> None:
         print(f"safe region (pct={pct}): x[{safe_l:.0f},{safe_r:.0f}] y[{safe_t:.0f},{safe_b:.0f}] "
               f"= {safe_r - safe_l:.0f}x{safe_b - safe_t:.0f}", flush=True)
 
-        if args.auto_crop:
+        if args.crop_rect:
+            cx0, cy0, crop_w, crop_h = (int(v) for v in args.crop_rect.split(","))
+        elif args.auto_crop:
             aw, ah = (int(v) for v in args.aspect.split(":"))
             avail_w, avail_h = safe_r - safe_l, safe_b - safe_t
             if avail_w / avail_h > aw / ah:
@@ -467,10 +479,16 @@ def main() -> None:
         else:
             cx0 = int(ref_center_x - crop_w / 2)
             cy0 = int(ref_center_y - crop_h / 2)
-        print(f"crop {crop_w}x{crop_h} at ({cx0},{cy0})", flush=True)
+        # Output size: downscale the crop rect to (out_w,out_h) if given — this is
+        # how we "zoom out" (capture a larger source rect, fit a standard frame).
+        out_w = args.out_w or crop_w; out_h = args.out_h or crop_h
+        out_w -= out_w % 2; out_h -= out_h % 2
+        sx = out_w / crop_w; sy = out_h / crop_h
+        print(f"crop {crop_w}x{crop_h} at ({cx0},{cy0}) -> output {out_w}x{out_h} "
+              f"(scale {sx:.4f})", flush=True)
 
         border_mode = cv2.BORDER_REPLICATE if args.border == "replicate" else cv2.BORDER_CONSTANT
-        T_out = np.array([[1, 0, -cx0], [0, 1, -cy0], [0, 0, 1]], dtype=np.float32)
+        T_out = np.array([[sx, 0, -cx0 * sx], [0, sy, -cy0 * sy], [0, 0, 1]], dtype=np.float32)
 
         # ---- Pass B: render. ----
         # Optional per-frame sub-pixel ECC refinement against FRAME 0 on a small
@@ -516,13 +534,21 @@ def main() -> None:
                   f"search +/-{apad}px", flush=True)
 
         enc = pick_encoder(preview=args.preview)
+        # Grade in-pass: float pipeline -> lut3d -> 10-bit p010 (smooth-sky safe).
+        if args.lut:
+            lutp = args.lut.replace("\\", "/").replace(":", "\\:")
+            vf = ["-vf", f"format=gbrpf32le,lut3d='{lutp}':interp=tetrahedral,format=p010le"]
+            out_pix = "p010le"
+        else:
+            vf = []
+            out_pix = "yuv420p"
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
                "-f", "rawvideo", "-pix_fmt", "bgr24",
-               "-s", f"{crop_w}x{crop_h}", "-r", f"{fps}",
+               "-s", f"{out_w}x{out_h}", "-r", f"{fps}",
                "-i", "-", "-i", args.input,
-               "-map", "0:v", "-map", "1:a?",
+               "-map", "0:v", "-map", "1:a?", *vf,
                *enc, "-b:v", args.bitrate, "-tag:v", "hvc1",
-               "-pix_fmt", "yuv420p",
+               "-pix_fmt", out_pix,
                "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709",
                "-bsf:v", "hevc_metadata=colour_primaries=1:transfer_characteristics=1:matrix_coefficients=1",
                "-c:a", "aac", "-b:a", "192k", "-shortest", args.output]
@@ -589,7 +615,7 @@ def main() -> None:
                 else:
                     anchor["n_skip"] += 1
             out_M = (T_out @ M3)[:2].astype(np.float32)
-            stab = cv2.warpAffine(frame, out_M, (crop_w, crop_h),
+            stab = cv2.warpAffine(frame, out_M, (out_w, out_h),
                                   flags=cv2.INTER_CUBIC, borderMode=border_mode)
             proc.stdin.write(stab.tobytes())
             if fi % 200 == 0:
