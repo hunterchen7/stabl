@@ -238,9 +238,35 @@ def run_cotracker_stabl(job: jobs.Job) -> None:
     job.output_file_id = file_id
 
 
+def run_cotracker_track(job: jobs.Job) -> None:
+    """CoTracker3 tracking only — produces a tracks.json that the Mac can
+    download and warp+encode locally. Much smaller transfer than the full
+    stabilized video. ~3-8 MB JSON vs 100+ MB MP4."""
+    p = job.params
+    clip_path = _maybe_trim(job, _resolve_clip(p), p)
+    file_id = uuid.uuid4().hex if False else None
+    # Use _output_path's id but with a .json suffix
+    import uuid as _uuid
+    file_id = _uuid.uuid4().hex
+    out_path = settings.OUTPUTS_DIR / f"{file_id}.json"
+    cmd = [
+        sys.executable, str(settings.REPO_ROOT / "cotracker_track.py"),
+        "--input", str(clip_path),
+        "--output_json", str(out_path),
+        "--n_points", str(p.get("n_points", 80)),
+        "--max_track_dim", str(p.get("max_track_dim", 480)),
+        "--mode", p.get("cotracker_mode", "online"),
+    ]
+    if p.get("mask_circle"):
+        cmd += ["--mask_circle", p["mask_circle"]]
+    _run_subprocess(job, cmd)
+    job.output_file_id = file_id
+
+
 RUNNERS = {
     "klt-affine": run_klt_affine,
     "stabl-track-csv": run_stabl_track_csv,
     "dlc-stabl": run_dlc_stabl,
     "cotracker-stabl": run_cotracker_stabl,
+    "cotracker-track": run_cotracker_track,
 }

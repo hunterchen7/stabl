@@ -58,5 +58,24 @@ case "$cmd" in
     echo "remote: $remote_sha"
     [ "$local_sha" = "$remote_sha" ] && echo "IN SYNC" || echo "DIVERGED — push then run: stabl sync"
     ;;
-  *)       echo "usage: stabl {health|upload|upload-rsync|upload-r2|job|status|jobs|get|deploy|restart} ..." >&2; exit 2 ;;
+  track-warp)  # stabl track-warp <pictures_path> <local_source.mp4> <out.mp4> [extra_klt_args...]
+    # GPU-tracking on server, warp+encode locally. ~30x smaller transfer than cotracker-stabl.
+    pic="$1"; src="$2"; out="$3"; shift 3
+    body=$(printf '{"pictures_path":"%s","n_points":80,"max_track_dim":480,"cotracker_mode":"online"}' "$pic")
+    resp=$(curl -fsS "${AUTH[@]}" -H "Content-Type: application/json" -d "$body" "$BASE/v1/jobs/cotracker-track")
+    jid=$(printf '%s' "$resp" | sed -n 's/.*"job_id":"\([^"]*\)".*/\1/p')
+    [ -z "$jid" ] && { echo "fire failed: $resp" >&2; exit 1; }
+    echo "tracking on server (job $jid)..." >&2
+    until s=$(curl -fsS "${AUTH[@]}" "$BASE/v1/jobs/$jid" | python3 -c 'import sys,json;d=json.load(sys.stdin);print(d["status"], d.get("output_file_id") or "")' 2>/dev/null); [ "${s%% *}" = "done" ] || [ "${s%% *}" = "failed" ]; do sleep 8; done
+    state="${s%% *}"; oid="${s##* }"
+    [ "$state" = "failed" ] && { echo "track failed" >&2; exit 1; }
+    tmp_json=$(mktemp -t stabl-tracks.XXXXXX.json)
+    echo "downloading tracks..." >&2
+    curl -fsS "${AUTH[@]}" -o "$tmp_json" "$BASE/v1/files/$oid"
+    echo "warping locally..." >&2
+    ~/Documents/GitHub/stabl/.venv/bin/python ~/Documents/GitHub/stabl/klt_affine.py \
+      --input "$src" --output "$out" --tracks_json "$tmp_json" "$@"
+    rm -f "$tmp_json"
+    echo "done -> $out" >&2 ;;
+  *)       echo "usage: stabl {health|upload|upload-rsync|upload-r2|job|status|jobs|get|track-warp|restart|version|sync|check} ..." >&2; exit 2 ;;
 esac
