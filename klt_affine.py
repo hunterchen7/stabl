@@ -123,7 +123,7 @@ def main() -> None:
                     help="(tracks_json mode) Write the SOURCE video with each tracked "
                          "point drawn as a numbered circle. Don't stabilise — just show "
                          "what is being tracked.")
-    ap.add_argument("--border", choices=["replicate", "constant", "shrink"], default="shrink",
+    ap.add_argument("--border", choices=["replicate", "constant", "shrink"], default="constant",
                     help="What to do when the stabilized crop goes past source edges. "
                          "shrink: pre-scan all frames and pick a crop size that never reveals "
                          "borders (cleanest). constant: black borders. replicate: stretch "
