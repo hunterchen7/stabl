@@ -305,11 +305,12 @@ def main() -> None:
             return M
 
         Ms = []
+        good_fit = np.zeros(N, dtype=bool)
         ident = np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32)
         last_M = ident.copy()
         for fi in range(N):
             if fi == 0:
-                Ms.append(ident.copy()); continue
+                Ms.append(ident.copy()); good_fit[0] = True; continue
             visible = tracks[fi, :, 2] >= args.vis_thresh
             cur = tracks[fi, :, :2].astype(np.float32)
             if visible.sum() < 3:
@@ -322,6 +323,30 @@ def main() -> None:
                 M = robust_fit(cur[visible], init_full[visible])
             M = M.astype(np.float32)
             Ms.append(M); last_M = M
+            good_fit[fi] = True
+
+        # Bridge visibility-collapse gaps by interpolating the warp between the
+        # bracketing good frames (camera motion is continuous; gaps are short).
+        # Holding a frozen warp through a gap lets the scene drift — this doesn't.
+        n_interp = 0
+        gi = np.where(good_fit)[0]
+        for a, b in zip(gi[:-1], gi[1:]):
+            if b - a <= 1:
+                continue
+            Ma, Mb = Ms[a], Ms[b]
+            angA = np.arctan2(Ma[1, 0], Ma[0, 0]); angB = np.arctan2(Mb[1, 0], Mb[0, 0])
+            scA = np.hypot(Ma[0, 0], Ma[1, 0]);    scB = np.hypot(Mb[0, 0], Mb[1, 0])
+            for fi in range(a + 1, b):
+                t = (fi - a) / (b - a)
+                ang = angA + t * (angB - angA)
+                sc = scA + t * (scB - scA)
+                tx = Ma[0, 2] + t * (Mb[0, 2] - Ma[0, 2])
+                ty = Ma[1, 2] + t * (Mb[1, 2] - Ma[1, 2])
+                Ms[fi] = np.array([[sc * np.cos(ang), -sc * np.sin(ang), tx],
+                                   [sc * np.sin(ang),  sc * np.cos(ang), ty]], dtype=np.float32)
+                n_interp += 1
+        print(f"fit: {int(good_fit.sum())}/{N} frames direct, {n_interp} interpolated, "
+              f"{N - int(good_fit.sum()) - n_interp} held", flush=True)
 
         # Optional light temporal smoothing of the warp to remove residual
         # per-frame estimation jitter (safe for a static lock — no subject lag).
