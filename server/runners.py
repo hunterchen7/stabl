@@ -271,6 +271,8 @@ def run_cotracker_track(job: jobs.Job) -> None:
     ]
     if p.get("mask_circle"):
         cmd += ["--mask_circle", p["mask_circle"]]
+    if p.get("query_points"):
+        cmd += ["--query_points", p["query_points"]]
     _run_subprocess(job, cmd)
     job.output_file_id = file_id
 

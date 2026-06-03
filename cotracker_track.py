@@ -36,6 +36,10 @@ def main() -> None:
     ap.add_argument("--mask_circle", default=None,
                     help="cx,cy,r in SOURCE coords — exclude this circle from query "
                          "point selection (e.g. mask the bird).")
+    ap.add_argument("--query_points", default=None,
+                    help="Semicolon-separated explicit query coords in SOURCE resolution: "
+                         "'x1,y1;x2,y2;...'. Skips goodFeaturesToTrack and tracks exactly "
+                         "these points instead. For manual selection.")
     args = ap.parse_args()
 
     import torch
@@ -69,24 +73,37 @@ def main() -> None:
     video = video[None].cuda()  # [1, N, 3, Ht, Wt]
 
     # Pick query points on frame 0 (in tracking coords).
-    gray0 = cv2.cvtColor(frames[0], cv2.COLOR_RGB2GRAY)
-    mask = None
-    if args.mask_circle:
-        cx, cy, r = (float(v) for v in args.mask_circle.split(","))
-        cx *= scale; cy *= scale; r *= scale
-        mask = np.ones((Ht, Wt), dtype=np.uint8) * 255
-        cv2.circle(mask, (int(cx), int(cy)), int(r), 0, -1)
-    corners = cv2.goodFeaturesToTrack(
-        gray0, maxCorners=args.n_points, qualityLevel=0.005,
-        minDistance=12, mask=mask, blockSize=9)
-    if corners is None or len(corners) < 5:
-        sys.exit(f"too few query points found ({0 if corners is None else len(corners)})")
-    P = len(corners)
-    queries = torch.zeros(1, P, 3, device="cuda")
-    queries[0, :, 0] = 0
-    queries[0, :, 1] = torch.from_numpy(corners[:, 0, 0]).cuda()
-    queries[0, :, 2] = torch.from_numpy(corners[:, 0, 1]).cuda()
-    print(f"picked {P} query points; running {args.mode} inference", flush=True)
+    if args.query_points:
+        pts_src = np.array([
+            [float(x), float(y)]
+            for x, y in (chunk.split(",") for chunk in args.query_points.split(";"))
+        ])
+        pts = pts_src * scale  # to tracking coords
+        P = len(pts)
+        queries = torch.zeros(1, P, 3, device="cuda")
+        queries[0, :, 0] = 0
+        queries[0, :, 1] = torch.from_numpy(pts[:, 0].astype(np.float32)).cuda()
+        queries[0, :, 2] = torch.from_numpy(pts[:, 1].astype(np.float32)).cuda()
+        print(f"using {P} caller-provided query points", flush=True)
+    else:
+        gray0 = cv2.cvtColor(frames[0], cv2.COLOR_RGB2GRAY)
+        mask = None
+        if args.mask_circle:
+            cx, cy, r = (float(v) for v in args.mask_circle.split(","))
+            cx *= scale; cy *= scale; r *= scale
+            mask = np.ones((Ht, Wt), dtype=np.uint8) * 255
+            cv2.circle(mask, (int(cx), int(cy)), int(r), 0, -1)
+        corners = cv2.goodFeaturesToTrack(
+            gray0, maxCorners=args.n_points, qualityLevel=0.005,
+            minDistance=12, mask=mask, blockSize=9)
+        if corners is None or len(corners) < 3:
+            sys.exit(f"too few query points found ({0 if corners is None else len(corners)})")
+        P = len(corners)
+        queries = torch.zeros(1, P, 3, device="cuda")
+        queries[0, :, 0] = 0
+        queries[0, :, 1] = torch.from_numpy(corners[:, 0, 0]).cuda()
+        queries[0, :, 2] = torch.from_numpy(corners[:, 0, 1]).cuda()
+        print(f"picked {P} query points; running {args.mode} inference", flush=True)
 
     with torch.no_grad():
         if args.mode == "offline":
