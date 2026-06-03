@@ -94,10 +94,10 @@ def version() -> dict:
 
 @app.post("/v1/sync", dependencies=[Depends(require_bearer)])
 def sync(body: dict | None = None) -> dict:
-    """Git pull + reinstall + restart. Server pulls from origin/<branch>
-    (default main). Idempotent — returns the new SHA."""
+    """Git pull origin/main + reinstall + restart. Hardcoded to main —
+    add a release/tag path later if branch deploys are needed."""
     import subprocess, os, signal, threading
-    branch = (body or {}).get("branch", "main")
+    branch = "main"
     repo = settings.REPO_ROOT
     out = []
     def run(*cmd):

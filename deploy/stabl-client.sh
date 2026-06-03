@@ -48,10 +48,8 @@ case "$cmd" in
     curl -fsS "${AUTH[@]}" -o "$2" "$BASE/v1/files/$1" ;;
   restart) curl -fsS "${AUTH[@]}" -X POST "$BASE/v1/restart" ;;
   version) curl -fsS "$BASE/v1/version" ;;
-  sync)    # stabl sync [branch]
-    branch="${1:-main}"
-    curl -fsS "${AUTH[@]}" -H "Content-Type: application/json" \
-      -d "{\"branch\":\"$branch\"}" "$BASE/v1/sync" ;;
+  sync)    # stabl sync — pulls origin/main on the server, then restarts
+    curl -fsS "${AUTH[@]}" -X POST "$BASE/v1/sync" ;;
   check)   # quick local vs remote parity check
     local_sha=$(cd ~/Documents/GitHub/stabl && git rev-parse HEAD 2>/dev/null)
     remote=$(curl -fsS "$BASE/v1/version")
