@@ -130,6 +130,58 @@ async def restart() -> dict:
     return {"restarting": True}
 
 
+@app.get("/v1/diag", dependencies=[Depends(require_bearer)])
+def diag() -> dict:
+    """Read-only host diagnostics. Used to investigate Olares-side memory
+    pressure / k3s pod state when SSH-via-Tailscale and Olares Space FRP
+    are both unavailable. Runs as the `olares` host user — only sees what
+    that user can read (which is enough for ps / kubectl if the k3s
+    kubeconfig is group-readable, which is the default on Olares)."""
+    import subprocess
+    def run(*cmd, timeout=10):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            return {"rc": r.returncode, "out": r.stdout[-8000:], "err": r.stderr[-2000:]}
+        except Exception as e:
+            return {"rc": -1, "err": str(e)}
+    out: dict = {}
+    out["uptime"] = run("uptime")
+    try:
+        out["loadavg"] = {"out": open("/proc/loadavg").read()}
+    except Exception as e:
+        out["loadavg"] = {"err": str(e)}
+    try:
+        out["meminfo"] = {"out": open("/proc/meminfo").read()}
+    except Exception as e:
+        out["meminfo"] = {"err": str(e)}
+    out["top_rss"] = run("bash", "-c",
+        "ps axo pid,rss,user,comm --sort=-rss | head -30")
+    out["top_swap"] = run("bash", "-c",
+        "for f in /proc/*/status; do "
+        "  awk '/^Name:/{n=$2} /^VmSwap:/{print $2,n}' \"$f\" 2>/dev/null; "
+        "done | sort -nr | head -20")
+    out["kubectl_top_pods"] = run("bash", "-c",
+        "for kc in /etc/rancher/k3s/k3s.yaml $HOME/.kube/config; do "
+        "  [ -r \"$kc\" ] && { "
+        "    KUBECONFIG=\"$kc\" kubectl top pod -A --sort-by=memory 2>&1 | head -40; "
+        "    exit 0; "
+        "  }; "
+        "done; echo '(no readable kubeconfig)'")
+    out["kubectl_bad_pods"] = run("bash", "-c",
+        "for kc in /etc/rancher/k3s/k3s.yaml $HOME/.kube/config; do "
+        "  [ -r \"$kc\" ] && { "
+        "    KUBECONFIG=\"$kc\" kubectl get pods -A --no-headers 2>&1 "
+        "      | awk '$4!=\"Running\" && $4!=\"Completed\"' | head -40; "
+        "    exit 0; "
+        "  }; "
+        "done; echo '(no readable kubeconfig)'")
+    out["systemctl_failed"] = run("bash", "-c",
+        "systemctl list-units --state=failed --no-pager 2>&1 | head -20")
+    out["dmesg_tail"] = run("bash", "-c",
+        "dmesg 2>/dev/null | tail -30 || echo '(no dmesg access)'")
+    return out
+
+
 @app.post("/v1/upload/r2/finalize", dependencies=[Depends(require_bearer)])
 async def r2_finalize(body: dict) -> dict:
     """After client PUTs to R2, call this with {file_id, r2_key}. Server
