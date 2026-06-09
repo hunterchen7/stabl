@@ -182,6 +182,83 @@ def diag() -> dict:
     return out
 
 
+@app.get("/v1/proc/{pid}", dependencies=[Depends(require_bearer)])
+def proc_info(pid: int) -> dict:
+    """Read-only inspection of a single host process via /proc: cmdline,
+    cwd, exe, status. No shell execution. Used to identify what a
+    specific high-RSS process actually is during incident response."""
+    base = f"/proc/{pid}"
+    out: dict = {"pid": pid}
+    def read(p):
+        try:
+            with open(p, "rb") as f:
+                return f.read().decode("utf-8", "replace")
+        except Exception as e:
+            return f"<error: {e}>"
+    def readlink(p):
+        import os
+        try:
+            return os.readlink(p)
+        except Exception as e:
+            return f"<error: {e}>"
+    out["cmdline"] = read(f"{base}/cmdline").replace("\x00", " ").strip()
+    out["exe"] = readlink(f"{base}/exe")
+    out["cwd"] = readlink(f"{base}/cwd")
+    status = read(f"{base}/status")
+    out["status"] = "\n".join(
+        ln for ln in status.splitlines()
+        if ln.startswith(("Name:", "Pid:", "PPid:", "Uid:", "VmRSS:",
+                          "VmSize:", "VmSwap:", "Threads:", "State:"))
+    )
+    return out
+
+
+@app.get("/v1/pods", dependencies=[Depends(require_bearer)])
+def list_pods(only_unhealthy: bool = False) -> dict:
+    """List k3s pods (all or only non-Running/Completed). kubectl
+    against the system kubeconfig — read-only."""
+    import subprocess
+    filt = (" | awk '$4!=\"Running\" && $4!=\"Completed\"'"
+            if only_unhealthy else "")
+    cmd = (
+        "for kc in /etc/rancher/k3s/k3s.yaml $HOME/.kube/config; do "
+        "  [ -r \"$kc\" ] && { "
+        f"    KUBECONFIG=\"$kc\" kubectl get pods -A -o wide --no-headers 2>&1{filt}; "
+        "    exit 0; "
+        "  }; "
+        "done; echo '(no readable kubeconfig)'"
+    )
+    r = subprocess.run(["bash", "-c", cmd], capture_output=True,
+                        text=True, timeout=20)
+    return {"rc": r.returncode, "out": r.stdout, "err": r.stderr[-2000:]}
+
+
+@app.post("/v1/kick-pod", dependencies=[Depends(require_bearer)])
+def kick_pod(body: dict) -> dict:
+    """Delete one pod by namespace+name so k8s reschedules it. Used to
+    revive a specific pod that has crashed but isn't auto-recovering
+    (e.g. OOMKilled control-plane pod). Uses k8s default grace period
+    — no --force. Names validated as DNS-1123 to prevent shell injection."""
+    import subprocess, re
+    ns = body.get("namespace", "")
+    name = body.get("name", "")
+    if not re.fullmatch(r"[a-z0-9.-]{1,253}", ns) \
+            or not re.fullmatch(r"[a-z0-9.-]{1,253}", name):
+        raise HTTPException(400,
+            "namespace/name must be lowercase alphanumerics/./- only")
+    cmd = (
+        "for kc in /etc/rancher/k3s/k3s.yaml $HOME/.kube/config; do "
+        "  [ -r \"$kc\" ] && { "
+        f"    KUBECONFIG=\"$kc\" kubectl -n {ns} delete pod {name} 2>&1; "
+        "    exit 0; "
+        "  }; "
+        "done; echo '(no readable kubeconfig)'"
+    )
+    r = subprocess.run(["bash", "-c", cmd], capture_output=True,
+                        text=True, timeout=30)
+    return {"rc": r.returncode, "out": r.stdout, "err": r.stderr[-2000:]}
+
+
 @app.post("/v1/upload/r2/finalize", dependencies=[Depends(require_bearer)])
 async def r2_finalize(body: dict) -> dict:
     """After client PUTs to R2, call this with {file_id, r2_key}. Server
