@@ -234,6 +234,21 @@ def diag() -> dict:
         "  -o -iname '_diag' 2>/dev/null | head -20")
     out["all_listening_ports"] = run("bash", "-c",
         "ss -tlnp 2>/dev/null | head -30 || netstat -tlnp 2>/dev/null | head -30")
+    # Dump POD+IMAGE for namespaces that could plausibly host a runner.
+    out["pods_in_dev_ns"] = run("bash", "-c",
+        "for kc in /etc/rancher/k3s/k3s.yaml $HOME/.kube/config; do "
+        "  [ -r \"$kc\" ] && { "
+        "    for ns in devworkspace-dev-hunterchen studio-hunterchen studioserver-shared "
+        "              windows-hunterchen user-system-hunterchen user-space-hunterchen "
+        "              default os-platform; do "
+        "      echo \"=== ns:$ns ===\"; "
+        "      KUBECONFIG=\"$kc\" kubectl -n \"$ns\" get pods "
+        "        -o custom-columns=POD:.metadata.name,IMAGES:'.spec.containers[*].image' "
+        "        --no-headers 2>&1 | head -20; "
+        "    done; "
+        "    exit 0; "
+        "  }; "
+        "done")
     return out
 
 
