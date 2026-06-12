@@ -179,6 +179,18 @@ def diag() -> dict:
         "systemctl list-units --state=failed --no-pager 2>&1 | head -20")
     out["dmesg_tail"] = run("bash", "-c",
         "dmesg 2>/dev/null | tail -30 || echo '(no dmesg access)'")
+    out["runners_ps"] = run("bash", "-c",
+        "ps -eo pid,ppid,user,etime,rss,comm,args 2>/dev/null "
+        "| grep -iE 'runner|actions|github' | grep -v grep | head -20")
+    out["runner_homes"] = run("bash", "-c",
+        "for d in /home/*/actions-runner /opt/actions-runner "
+        "         /home/*/_work /opt/_work; do "
+        "  [ -d \"$d\" ] && echo \"$d\"; "
+        "done")
+    out["docker_containers"] = run("bash", "-c",
+        "{ docker ps --format 'table {{.Names}}\\t{{.Image}}\\t{{.Status}}' 2>&1 "
+        "  || podman ps --format 'table {{.Names}}\\t{{.Image}}\\t{{.Status}}' 2>&1 "
+        "  || echo '(no docker/podman socket access)'; } | head -20")
     return out
 
 
