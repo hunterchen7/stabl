@@ -208,6 +208,32 @@ def diag() -> dict:
     out["systemd_runner_units"] = run("bash", "-c",
         "systemctl list-units --all --no-pager --type=service 2>&1 "
         "| grep -iE 'runner|actions|github' | head -10")
+    # Deeper hunt — runners may be in a privileged k8s pod via docker socket,
+    # or named differently in some user-space namespace.
+    out["pods_by_image"] = run("bash", "-c",
+        "for kc in /etc/rancher/k3s/k3s.yaml $HOME/.kube/config; do "
+        "  [ -r \"$kc\" ] && { "
+        "    KUBECONFIG=\"$kc\" kubectl get pods -A "
+        "      -o custom-columns=NS:.metadata.namespace,POD:.metadata.name,IMAGES:'.spec.containers[*].image' "
+        "      --no-headers 2>&1 "
+        "      | grep -iE 'runner|actions|github|myoung34|summerwind|advocate' "
+        "      | head -10; "
+        "    exit 0; "
+        "  }; "
+        "done; echo '(no readable kubeconfig)'")
+    out["all_namespaces"] = run("bash", "-c",
+        "for kc in /etc/rancher/k3s/k3s.yaml $HOME/.kube/config; do "
+        "  [ -r \"$kc\" ] && { "
+        "    KUBECONFIG=\"$kc\" kubectl get ns --no-headers 2>&1; "
+        "    exit 0; "
+        "  }; "
+        "done")
+    out["search_disk_for_runner"] = run("bash", "-c",
+        "find /home/olares /root /opt /etc -maxdepth 5 "
+        "  -iname '*actions-runner*' -o -iname '*github-runner*' "
+        "  -o -iname '_diag' 2>/dev/null | head -20")
+    out["all_listening_ports"] = run("bash", "-c",
+        "ss -tlnp 2>/dev/null | head -30 || netstat -tlnp 2>/dev/null | head -30")
     return out
 
 
