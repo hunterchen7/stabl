@@ -191,6 +191,23 @@ def diag() -> dict:
         "{ docker ps --format 'table {{.Names}}\\t{{.Image}}\\t{{.Status}}' 2>&1 "
         "  || podman ps --format 'table {{.Names}}\\t{{.Image}}\\t{{.Status}}' 2>&1 "
         "  || echo '(no docker/podman socket access)'; } | head -20")
+    out["docker_ps_all"] = run("bash", "-c",
+        "docker ps -a --format 'table {{.Names}}\\t{{.Image}}\\t{{.Status}}' 2>&1 | head -40")
+    out["containerd_ctrs"] = run("bash", "-c",
+        "for ns in $(sudo -n /usr/local/bin/ctr ns list -q 2>/dev/null "
+        "             || /usr/local/bin/ctr ns list -q 2>/dev/null "
+        "             || echo default k8s.io moby); do "
+        "  echo \"--- ns:$ns ---\"; "
+        "  /usr/local/bin/ctr -n \"$ns\" containers ls 2>&1 | head -10; "
+        "done 2>&1 | head -40")
+    out["runner_search"] = run("bash", "-c",
+        "ls -la /home/olares/actions-runner /home/olares/_work "
+        "       /opt/actions-runner /opt/_work "
+        "       /etc/systemd/system/actions-runner*.service 2>&1 "
+        "| head -20")
+    out["systemd_runner_units"] = run("bash", "-c",
+        "systemctl list-units --all --no-pager --type=service 2>&1 "
+        "| grep -iE 'runner|actions|github' | head -10")
     return out
 
 
