@@ -5,7 +5,7 @@ import shutil
 import uuid
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 
 from . import jobs, runners, settings
@@ -93,22 +93,9 @@ def version() -> dict:
 
 
 @app.post("/v1/sync", dependencies=[Depends(require_bearer)])
-def sync(request: Request, body: dict | None = None) -> dict:
+def sync(body: dict | None = None) -> dict:
     """Git pull origin/main + reinstall + restart. Hardcoded to main —
-    add a release/tag path later if branch deploys are needed.
-
-    Loopback-only: trusted X-Forwarded-For chain (uvicorn is started
-    with --forwarded-allow-ips=127.0.0.1) means request.client.host
-    is the original client IP when behind cloudflared, or 127.0.0.1
-    when called directly on localhost. Restricting to loopback
-    effectively makes the deploy require tailnet access — you SSH to
-    olares (which needs Tailscale) and call localhost:8000 from there.
-    Stops a leaked bearer token from being deploy-capable on its own.
-    """
-    if request.client is None or request.client.host not in ("127.0.0.1", "::1"):
-        raise HTTPException(403,
-            "sync only accepts loopback connections; "
-            "ssh into the host and call localhost:8000")
+    add a release/tag path later if branch deploys are needed."""
     import subprocess, os, signal, threading
     branch = "main"
     repo = settings.REPO_ROOT
