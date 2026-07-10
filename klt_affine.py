@@ -24,6 +24,12 @@ import cv2
 import numpy as np
 
 
+def effective_auto_crop_percentile(requested: float, border: str) -> float:
+    if not 0 <= requested < 50:
+        raise ValueError("auto_crop_pct must be in [0, 50)")
+    return 0.0 if border == "shrink" else requested
+
+
 def pick_encoder(preview: bool = False) -> list[str]:
     """Prefer GPU encode; fall back to CPU x265. With preview=True, pick
     the fastest available options (lower quality is fine)."""
@@ -158,7 +164,7 @@ def main() -> None:
                          "--auto_crop_pct, maximizing usable area.")
     ap.add_argument("--auto_crop_pct", type=float, default=2.0,
                     help="Percentile slack for auto_crop: ignore the worst this-%% of frames "
-                         "per edge (e.g. a brief takeoff lurch) when sizing the crop.")
+                         "per edge when sizing the crop. border=shrink always forces 0%%.")
     ap.add_argument("--aspect", default="16:9", help="Aspect for --auto_crop.")
     ap.add_argument("--crop_rect", default=None,
                     help="x0,y0,w,h source px — explicit crop rectangle (overrides --auto_crop). "
@@ -463,7 +469,12 @@ def main() -> None:
         # must sit at the *high* percentile of per-frame left/top edges, and the
         # right/bottom at the *low* percentile of right/bottom edges. (Getting these
         # sides backwards yields the full frame — i.e. no crop.)
-        pct = args.auto_crop_pct
+        try:
+            pct = effective_auto_crop_percentile(args.auto_crop_pct, args.border)
+        except ValueError as exc:
+            sys.exit(str(exc))
+        if args.border == "shrink" and args.auto_crop_pct != 0:
+            print("border=shrink: forcing auto_crop_pct=0 for all-frame coverage", flush=True)
         safe_l = max(0, np.percentile(Ls, 100 - pct))
         safe_r = min(W, np.percentile(Rs, pct))
         safe_t = max(0, np.percentile(Ts, 100 - pct))
